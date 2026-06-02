@@ -16,3 +16,6 @@
 [submodule "third_party/HybridEP"]
 	path = packages/paddlefleet_ops/third_party/HybridEP
 	url = https://github.com/PFCCLab/DeepEP.git
+[submodule "packages/paddlefleet_ops/third_party/FlashMLA"]
+	path = packages/paddlefleet_ops/third_party/FlashMLA
+	url = https://github.com/PFCCLab/FlashMLA.git
