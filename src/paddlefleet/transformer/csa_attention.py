@@ -1079,11 +1079,15 @@ class CompressedSparseAttention(FleetLayer):
             self.config,
             "csa_tilelang_enable_indexer",
         )
+        use_cudnn_indexer = bool(
+            getattr(self.config, "csa_cudnn_enable_indexer", False)
+        )
         # The fused TileLang indexer-loss path is only active during the
         # grad-enabled forward. Full recompute runs the first forward under
         # no_grad; that pass should only materialize main-attention indices.
+        # When cuDNN indexer is enabled it takes precedence over TileLang loss path.
         use_tilelang_loss_path = (
-            use_tilelang_indexer and self.training and paddle.is_grad_enabled()
+            use_tilelang_indexer and not use_cudnn_indexer and self.training and paddle.is_grad_enabled()
         )
         loss_topk_effective = _resolve_csa_indexer_loss_topk_effective(
             self.config,
@@ -1202,7 +1206,26 @@ class CompressedSparseAttention(FleetLayer):
 
         # Optionally replace topk producer with TileLang fused compressed
         # indexer forward. This only swaps the indices fed to sparse attention.
-        if use_tilelang_indexer and not use_tilelang_loss_path:
+        if use_cudnn_indexer and not use_tilelang_loss_path:
+            from paddlefleet.cudnn_ops.indexer.cudnn_indexer import (
+                cudnn_indexer_topk_fwd,
+            )
+
+            with paddle.no_grad():
+                q_indexer_cu, k_indexer_cu, weights_indexer_cu = (
+                    self.indexer.forward_before_topk(x_det, qr_det)
+                )
+                cu_topk_indices, _cu_topk_length = cudnn_indexer_topk_fwd(
+                    q_indexer_cu,
+                    k_indexer_cu,
+                    weights_indexer_cu,
+                    ratio=self.compress_ratio,
+                    topk_effective=attn_topk_effective,
+                )
+
+            topk_indices_compressed = cu_topk_indices
+
+        elif use_tilelang_indexer and not use_tilelang_loss_path:
             from paddlefleet.tilelang_ops import (
                 csa_indexer_topk_fwd,
             )
