@@ -12,14 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .cudnn_indexer import (
-    cudnn_indexer_forward,
-    cudnn_indexer_topk,
-    cudnn_indexer_topk_fwd,
-)
+from .cudnn_indexer import cudnn_indexer_topk_fwd
+from .csa_indexer_bwd_cudnn import csa_indexer_bwd
 
 __all__ = [
-    "cudnn_indexer_forward",
-    "cudnn_indexer_topk",
     "cudnn_indexer_topk_fwd",
+    "csa_indexer_bwd",
 ]

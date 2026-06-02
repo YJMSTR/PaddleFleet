@@ -12,8 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .indexer.cudnn_indexer import cudnn_indexer_topk_fwd
+"""cuDNN frontend ops bridged into PaddleFleet via dlpack."""
 
-__all__ = [
-    "cudnn_indexer_topk_fwd",
-]
+__all__ = ["cudnn_indexer_topk_fwd", "csa_indexer_bwd"]
+
+
+def __getattr__(name):
+    if name == "cudnn_indexer_topk_fwd":
+        from .indexer.cudnn_indexer import cudnn_indexer_topk_fwd
+
+        globals()[name] = cudnn_indexer_topk_fwd
+        return cudnn_indexer_topk_fwd
+    if name == "csa_indexer_bwd":
+        from .indexer.csa_indexer_bwd_cudnn import csa_indexer_bwd
+
+        globals()[name] = csa_indexer_bwd
+        return csa_indexer_bwd
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
