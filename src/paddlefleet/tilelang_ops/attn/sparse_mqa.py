@@ -146,16 +146,18 @@ def flash_mla_sparse_attn(
     return out_flat.reshape([b, sq, h, d]), lse.reshape([b, sq, h]), lse_indexer
 
 
-def sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=None, use_flashmla=None):
+def sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=None, use_flashmla=None, indexer_topk: int = 0):
     q, kv, attn_sink, topk_idxs = _prepare_inputs(q, kv, attn_sink, topk_idxs)
+    lse_indexer = None
 
     if use_flashmla if use_flashmla is not None else _USE_FLASH_MLA:
-        out, lse, _ = flash_mla_sparse_attn(
+        out, lse, lse_indexer = flash_mla_sparse_attn(
             q,
             kv,
             attn_sink,
             topk_idxs,
             sm_scale=sm_scale,
+            indexer_topk=indexer_topk,
         )
         # Convert FlashMLA log-e KV-only LSE to TileLang log2 LSE with sink.
         lse = paddle.logaddexp(lse, attn_sink) / math.log(2.0)
@@ -169,4 +171,4 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=None, use_flashmla=None):
             f"TileLang must return Paddle tensors, got output={type(out)!r}, lse={type(lse)!r}. "
             "Ensure paddle.enable_compat(scope={'tilelang'}) runs before import tilelang."
         )
-    return out, lse
+    return out, lse, lse_indexer

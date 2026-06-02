@@ -22,11 +22,14 @@ from .attn.sparse_mqa import (
 
 
 class CSASparseAttention(paddle.autograd.PyLayer):
+    _last_lse_indexer = None
+
     @staticmethod
     def forward(
         ctx, query, kv_full, attn_sink, topk_idxs, softmax_scale,
         sparse_fwd_backend="tilelang",
         sparse_bwd_backend="tilelang",
+        indexer_topk: int = 0,
     ):
         b, sq, np_heads, hn = query.shape
         ctx.query_shape = (b, sq, np_heads, hn)
@@ -40,16 +43,19 @@ class CSASparseAttention(paddle.autograd.PyLayer):
             topk_idxs,
         )
         paddle.core.nvprof_nvtx_push(f"sparse_attn_fwd[{sparse_fwd_backend}]")
-        output, lse = sparse_attn(
+        output, lse, lse_indexer = sparse_attn(
             query,
             kv_full,
             attn_sink,
             topk_idxs,
             sm_scale=ctx.softmax_scale,
             use_flashmla=(sparse_fwd_backend == "flashmla"),
+            indexer_topk=int(indexer_topk),
         )
         paddle.core.nvprof_nvtx_pop()
         ctx.save_for_backward(query, kv_full, attn_sink, topk_idxs, output, lse)
+        ctx.lse_indexer = lse_indexer
+        CSASparseAttention._last_lse_indexer = lse_indexer
         return output.reshape([b, sq, np_heads * hn])
 
     @staticmethod
@@ -107,8 +113,9 @@ def csa_sparse_attn(
     softmax_scale,
     sparse_fwd_backend="tilelang",
     sparse_bwd_backend="tilelang",
+    indexer_topk: int = 0,
 ):
-    return CSASparseAttention.apply(
+    output = CSASparseAttention.apply(
         query,
         kv_full,
         attn_sink,
@@ -116,4 +123,7 @@ def csa_sparse_attn(
         softmax_scale,
         sparse_fwd_backend,
         sparse_bwd_backend,
+        indexer_topk,
     )
+    lse_indexer = CSASparseAttention._last_lse_indexer
+    return output, lse_indexer
