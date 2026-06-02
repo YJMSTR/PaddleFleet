@@ -1079,15 +1079,18 @@ class CompressedSparseAttention(FleetLayer):
             self.config,
             "csa_tilelang_enable_indexer",
         )
-        use_cudnn_indexer = bool(
-            getattr(self.config, "csa_cudnn_enable_indexer", False)
+        indexer_backend = str(
+            getattr(self.config, "csa_indexer_backend", "tilelang")
         )
         # The fused TileLang indexer-loss path is only active during the
         # grad-enabled forward. Full recompute runs the first forward under
         # no_grad; that pass should only materialize main-attention indices.
-        # When cuDNN indexer is enabled it takes precedence over TileLang loss path.
+        # cuDNN backend overrides: skip fused loss path, use cuDNN topk only.
         use_tilelang_loss_path = (
-            use_tilelang_indexer and not use_cudnn_indexer and self.training and paddle.is_grad_enabled()
+            use_tilelang_indexer
+            and indexer_backend != "cudnn"
+            and self.training
+            and paddle.is_grad_enabled()
         )
         loss_topk_effective = _resolve_csa_indexer_loss_topk_effective(
             self.config,
@@ -1204,9 +1207,8 @@ class CompressedSparseAttention(FleetLayer):
                 mask=causal_mask,
             )
 
-        # Optionally replace topk producer with TileLang fused compressed
-        # indexer forward. This only swaps the indices fed to sparse attention.
-        if use_cudnn_indexer and not use_tilelang_loss_path:
+        # Optionally replace topk producer with an accelerated backend.
+        if indexer_backend == "cudnn" and not use_tilelang_loss_path:
             from paddlefleet.cudnn_ops.indexer.cudnn_indexer import (
                 cudnn_indexer_topk_fwd,
             )
