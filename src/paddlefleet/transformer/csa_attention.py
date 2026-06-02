@@ -1423,7 +1423,13 @@ class CompressedSparseAttention(FleetLayer):
         topk_idxs: Tensor,
         softmax_scale: float,
     ):
-        if _resolve_csa_tilelang_switch(
+        sparse_fwd_backend = str(
+            getattr(self.config, "csa_sparse_fwd_backend", "tilelang")
+        )
+        sparse_bwd_backend = str(
+            getattr(self.config, "csa_sparse_bwd_backend", "tilelang")
+        )
+        if sparse_fwd_backend == "flashmla" or _resolve_csa_tilelang_switch(
             self.config,
             "csa_tilelang_enable_sparse_attn",
         ):
@@ -1435,6 +1441,8 @@ class CompressedSparseAttention(FleetLayer):
                 attn_sink.cast("float32"),
                 topk_idxs,
                 softmax_scale,
+                sparse_fwd_backend=sparse_fwd_backend,
+                sparse_bwd_backend=sparse_bwd_backend,
             )
         else:
             output = unfused_compressed_sparse_attn(

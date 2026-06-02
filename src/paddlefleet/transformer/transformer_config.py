@@ -789,13 +789,25 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     csa_indexer_backend: str = "tilelang"
-    """CSA indexer backward backend.
+    """CSA indexer forward+backward backend.
 
-    One of {"tilelang", "cudnn"}; "triton" is reserved for future work.
-    Default "tilelang" preserves the legacy path. "cudnn" requires the
-    TileLang indexer forward (csa_tilelang_enable_indexer=True or
-    csa_tilelang_backend='attention_paddle_compat') because the cuDNN
-    backward consumes the TileLang forward's saved tensors.
+    One of {"tilelang", "cudnn"}. Default "tilelang" preserves the legacy
+    path. "cudnn" uses cuDNN DSA kernels for both forward and backward.
+    """
+
+    csa_sparse_fwd_backend: str = "tilelang"
+    """CSA sparse attention forward backend.
+
+    One of {"tilelang", "flashmla"}. Default "tilelang" uses the TileLang
+    sparse MQA kernel. "flashmla" uses the FlashMLA sparse forward kernel.
+    """
+
+    csa_sparse_bwd_backend: str = "tilelang"
+    """CSA sparse attention backward backend.
+
+    One of {"tilelang", "cudnn"}. Default "tilelang" uses the TileLang
+    sparse MQA backward. "cudnn" is reserved for a future cuDNN sparse
+    backward implementation.
     """
 
     o_groups: int = 8
@@ -843,6 +855,8 @@ class TransformerConfig(ModelParallelConfig):
         "csa_tilelang_enable_indexer": "csa_tilelang_enable_indexer",
         "csa_tilelang_enable_sparse_attn": "csa_tilelang_enable_sparse_attn",
         "csa_indexer_backend": "csa_indexer_backend",
+        "csa_sparse_fwd_backend": "csa_sparse_fwd_backend",
+        "csa_sparse_bwd_backend": "csa_sparse_bwd_backend",
         "o_groups": "o_groups",
         "o_lora_rank": "o_lora_rank",
         "qk_pos_emb_head_dim": "qk_pos_emb_head_dim",
@@ -1084,9 +1098,19 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "csa_tilelang_enable_sparse_attn=True requires csa_tilelang_backend='attention_paddle_compat'."
                 )
-            if self.csa_indexer_backend not in {"tilelang", "cudnn", "triton"}:
+            if self.csa_indexer_backend not in {"tilelang", "cudnn"}:
                 raise ValueError(
                     f"csa_indexer_backend={self.csa_indexer_backend!r} is invalid. "
+                    "Must be one of {'tilelang', 'cudnn'}."
+                )
+            if self.csa_sparse_fwd_backend not in {"tilelang", "flashmla"}:
+                raise ValueError(
+                    f"csa_sparse_fwd_backend={self.csa_sparse_fwd_backend!r} is invalid. "
+                    "Must be one of {'tilelang', 'flashmla'}."
+                )
+            if self.csa_sparse_bwd_backend not in {"tilelang", "cudnn"}:
+                raise ValueError(
+                    f"csa_sparse_bwd_backend={self.csa_sparse_bwd_backend!r} is invalid. "
                     "Must be one of {'tilelang', 'cudnn'}."
                 )
 

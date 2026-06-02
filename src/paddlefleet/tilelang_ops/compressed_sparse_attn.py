@@ -23,11 +23,16 @@ from .attn.sparse_mqa import (
 
 class CSASparseAttention(paddle.autograd.PyLayer):
     @staticmethod
-    def forward(ctx, query, kv_full, attn_sink, topk_idxs, softmax_scale):
+    def forward(
+        ctx, query, kv_full, attn_sink, topk_idxs, softmax_scale,
+        sparse_fwd_backend="tilelang",
+        sparse_bwd_backend="tilelang",
+    ):
         b, sq, np_heads, hn = query.shape
         ctx.query_shape = (b, sq, np_heads, hn)
         ctx.softmax_scale = float(softmax_scale)
         ctx.attn_sink_dtype = attn_sink.dtype
+        ctx.sparse_bwd_backend = str(sparse_bwd_backend)
         query, kv_full, attn_sink, topk_idxs = _prepare_inputs(
             query,
             kv_full,
@@ -40,6 +45,7 @@ class CSASparseAttention(paddle.autograd.PyLayer):
             attn_sink,
             topk_idxs,
             sm_scale=ctx.softmax_scale,
+            use_flashmla=(sparse_fwd_backend == "flashmla"),
         )
         ctx.save_for_backward(query, kv_full, attn_sink, topk_idxs, output, lse)
         return output.reshape([b, sq, np_heads * hn])
@@ -49,16 +55,31 @@ class CSASparseAttention(paddle.autograd.PyLayer):
         query, kv_full, attn_sink, topk_idxs, output, lse = ctx.saved_tensor()
         b, sq, np_heads, hn = ctx.query_shape
         grad_output = grad_output.reshape([b, sq, np_heads, hn])
-        dq, dkv, d_attn_sink = sparse_mqa_bwd.sparse_mqa_bwd_interface(
-            query,
-            kv_full,
-            attn_sink,
-            output,
-            grad_output,
-            topk_idxs,
-            lse,
-            ctx.softmax_scale,
-        )
+
+        if ctx.sparse_bwd_backend == "cudnn":
+            from paddlefleet.cudnn_ops import cudnn_sparse_attn_bwd
+
+            dq, dkv, d_attn_sink = cudnn_sparse_attn_bwd(
+                grad_output,
+                query,
+                kv_full,
+                attn_sink,
+                topk_idxs,
+                output,
+                lse,
+                ctx.softmax_scale,
+            )
+        else:
+            dq, dkv, d_attn_sink = sparse_mqa_bwd.sparse_mqa_bwd_interface(
+                query,
+                kv_full,
+                attn_sink,
+                output,
+                grad_output,
+                topk_idxs,
+                lse,
+                ctx.softmax_scale,
+            )
         dq = dq.reshape(query.shape)
         dkv = dkv.reshape(kv_full.shape)
         d_attn_sink = d_attn_sink.reshape(attn_sink.shape).cast(
@@ -78,6 +99,8 @@ def csa_sparse_attn(
     attn_sink,
     topk_idxs,
     softmax_scale,
+    sparse_fwd_backend="tilelang",
+    sparse_bwd_backend="tilelang",
 ):
     return CSASparseAttention.apply(
         query,
@@ -85,4 +108,6 @@ def csa_sparse_attn(
         attn_sink,
         topk_idxs,
         softmax_scale,
+        sparse_fwd_backend,
+        sparse_bwd_backend,
     )

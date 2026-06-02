@@ -133,10 +133,10 @@ def flash_mla_sparse_attn(
     return out_flat.reshape([b, sq, h, d]), lse.reshape([b, sq, h]), lse_indexer
 
 
-def sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=None):
+def sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=None, use_flashmla=None):
     q, kv, attn_sink, topk_idxs = _prepare_inputs(q, kv, attn_sink, topk_idxs)
 
-    if _USE_FLASH_MLA:
+    if use_flashmla if use_flashmla is not None else _USE_FLASH_MLA:
         out, lse, _ = flash_mla_sparse_attn(
             q,
             kv,
