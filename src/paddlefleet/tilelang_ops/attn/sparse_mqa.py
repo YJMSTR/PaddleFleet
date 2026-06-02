@@ -23,13 +23,25 @@ from . import sparse_mqa_fwd
 
 _USE_FLASH_MLA = strtobool(os.getenv("USE_FLASH_MLA", "0"))
 
+_flash_mla_sparse_fwd = None
+
 if _USE_FLASH_MLA:
     try:
-        from paddlefleet_ops.flash_mla import (
+        from flash_mla import (
             flash_mla_sparse_fwd as _flash_mla_sparse_fwd,
         )
     except (ImportError, RuntimeError):
         _flash_mla_sparse_fwd = None
+
+
+def _load_flash_mla_sparse_fwd():
+    global _flash_mla_sparse_fwd
+    if _flash_mla_sparse_fwd is None:
+        from flash_mla import (
+            flash_mla_sparse_fwd as _fn,
+        )
+        _flash_mla_sparse_fwd = _fn
+    return _flash_mla_sparse_fwd
 
 
 def _prepare_inputs(q, kv, attn_sink, topk_idxs):
@@ -97,7 +109,8 @@ def _local_to_global_flat(local_idxs, seqlen_kv: int):
 def flash_mla_sparse_attn(
     q, kv, attn_sink, topk_idxs, sm_scale=None, indexer_topk: int = 0
 ):
-    if _flash_mla_sparse_fwd is None:
+    fn = _load_flash_mla_sparse_fwd()
+    if fn is None:
         raise RuntimeError("flash_mla is not available")
 
     q, kv, attn_sink, topk_idxs = _prepare_inputs(q, kv, attn_sink, topk_idxs)
@@ -114,7 +127,7 @@ def flash_mla_sparse_attn(
     if topk_padded != topk:
         global_idxs = F.pad(global_idxs, (0, topk_padded - topk), value=-1)
 
-    res = _flash_mla_sparse_fwd(
+    res = fn(
         q_flat,
         kv_flat.unsqueeze(1),
         global_idxs.unsqueeze(1),

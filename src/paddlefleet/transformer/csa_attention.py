@@ -554,6 +554,7 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
             # precompute internally and multiplies the result by ``grad_loss``
             # in the GEMM kernel. ``num_rows == B * Sq`` matches cuDNN's
             # built-in ``grad_scale = loss_coeff / (B*Sq)``.
+            paddle.core.nvprof_nvtx_push("cudnn_indexer_bwd")
             grad_q, grad_weights, grad_k = csa_indexer_bwd(
                 index_q,
                 weights,
@@ -564,6 +565,7 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
                 loss_coeff=ctx.loss_coeff,
                 grad_loss=grad_loss,
             )
+            paddle.core.nvprof_nvtx_pop()
         elif ctx.indexer_backend == "tilelang":
             from paddlefleet.tilelang_ops import csa_indexer_bwd
             # Treat the forward eps as numerical protection only and use the
@@ -661,6 +663,7 @@ class TileLangCSAIndexerLossAutoScaler(paddle.autograd.PyLayer):
             else:
                 grad_loss_arg = paddle.to_tensor(float(scale), dtype=paddle.float32)
 
+            paddle.core.nvprof_nvtx_push("cudnn_indexer_bwd")
             grad_q, grad_weights, grad_k = csa_indexer_bwd(
                 index_q,
                 weights,
@@ -671,6 +674,7 @@ class TileLangCSAIndexerLossAutoScaler(paddle.autograd.PyLayer):
                 loss_coeff=ctx.loss_coeff,
                 grad_loss=grad_loss_arg,
             )
+            paddle.core.nvprof_nvtx_pop()
         elif ctx.indexer_backend == "tilelang":
             from paddlefleet.tilelang_ops import csa_indexer_bwd
 
@@ -1272,6 +1276,7 @@ class CompressedSparseAttention(FleetLayer):
                 q_indexer_cu, k_indexer_cu, weights_indexer_cu = (
                     self.indexer.forward_before_topk(x_det, qr_det)
                 )
+                paddle.core.nvprof_nvtx_push("cudnn_indexer_fwd")
                 cu_topk_indices, _cu_topk_length = cudnn_indexer_topk_fwd(
                     q_indexer_cu,
                     k_indexer_cu,
@@ -1279,6 +1284,7 @@ class CompressedSparseAttention(FleetLayer):
                     ratio=self.compress_ratio,
                     topk_effective=attn_topk_effective,
                 )
+                paddle.core.nvprof_nvtx_pop()
 
             topk_indices_compressed = cu_topk_indices
 
@@ -1435,6 +1441,7 @@ class CompressedSparseAttention(FleetLayer):
         ):
             from paddlefleet.tilelang_ops import csa_sparse_attn
 
+            paddle.core.nvprof_nvtx_push(f"csa_sparse_attn_fwd[{sparse_fwd_backend}]")
             output = csa_sparse_attn(
                 query,
                 kv_full,
@@ -1444,6 +1451,7 @@ class CompressedSparseAttention(FleetLayer):
                 sparse_fwd_backend=sparse_fwd_backend,
                 sparse_bwd_backend=sparse_bwd_backend,
             )
+            paddle.core.nvprof_nvtx_pop()
         else:
             output = unfused_compressed_sparse_attn(
                 query,

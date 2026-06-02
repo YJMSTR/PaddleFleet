@@ -39,6 +39,7 @@ class CSASparseAttention(paddle.autograd.PyLayer):
             attn_sink,
             topk_idxs,
         )
+        paddle.core.nvprof_nvtx_push(f"sparse_attn_fwd[{sparse_fwd_backend}]")
         output, lse = sparse_attn(
             query,
             kv_full,
@@ -47,6 +48,7 @@ class CSASparseAttention(paddle.autograd.PyLayer):
             sm_scale=ctx.softmax_scale,
             use_flashmla=(sparse_fwd_backend == "flashmla"),
         )
+        paddle.core.nvprof_nvtx_pop()
         ctx.save_for_backward(query, kv_full, attn_sink, topk_idxs, output, lse)
         return output.reshape([b, sq, np_heads * hn])
 
@@ -59,6 +61,7 @@ class CSASparseAttention(paddle.autograd.PyLayer):
         if ctx.sparse_bwd_backend == "cudnn":
             from paddlefleet.cudnn_ops import cudnn_sparse_attn_bwd
 
+            paddle.core.nvprof_nvtx_push("sparse_attn_bwd[cudnn]")
             dq, dkv, d_attn_sink = cudnn_sparse_attn_bwd(
                 grad_output,
                 query,
@@ -69,7 +72,9 @@ class CSASparseAttention(paddle.autograd.PyLayer):
                 lse,
                 ctx.softmax_scale,
             )
+            paddle.core.nvprof_nvtx_pop()
         else:
+            paddle.core.nvprof_nvtx_push("sparse_attn_bwd[tilelang]")
             dq, dkv, d_attn_sink = sparse_mqa_bwd.sparse_mqa_bwd_interface(
                 query,
                 kv_full,
@@ -80,6 +85,7 @@ class CSASparseAttention(paddle.autograd.PyLayer):
                 lse,
                 ctx.softmax_scale,
             )
+            paddle.core.nvprof_nvtx_pop()
         dq = dq.reshape(query.shape)
         dkv = dkv.reshape(kv_full.shape)
         d_attn_sink = d_attn_sink.reshape(attn_sink.shape).cast(
