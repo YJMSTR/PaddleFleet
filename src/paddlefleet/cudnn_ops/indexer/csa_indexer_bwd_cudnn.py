@@ -84,12 +84,7 @@ def _paddle_to_torch(t: paddle.Tensor):
 
 
 def _torch_to_paddle(t) -> paddle.Tensor:
-    """Bridge torch.Tensor -> paddle.Tensor via dlpack.
-
-    Zero-copy when the input is contiguous (cuDNN-allocated outputs always
-    are). Otherwise falls back to ``t.contiguous()``, which allocates a
-    fresh buffer and breaks aliasing with ``t``.
-    """
+    """Zero-copy torch GPU tensor -> Paddle tensor via DLPack."""
     if not t.is_contiguous():
         t = t.contiguous()
     return paddle.utils.dlpack.from_dlpack(t)
@@ -197,11 +192,23 @@ def csa_indexer_bwd(
     grad_weights = _torch_to_paddle(out["d_weights"])
     grad_k = _torch_to_paddle(out["d_index_k"])
 
+    # Release torch tensor references before cloning
+    del out
+
     if grad_q.dtype != orig_q_dtype:
         grad_q = grad_q.cast(orig_q_dtype)
     if grad_weights.dtype != orig_weights_dtype:
         grad_weights = grad_weights.cast(orig_weights_dtype)
     if grad_k.dtype != orig_k_dtype:
         grad_k = grad_k.cast(orig_k_dtype)
+
+    # Ensure grads are in paddle allocator (not torch cache) since they
+    # persist as param.grad until optimizer step completes.
+    grad_q = grad_q.clone()
+    grad_weights = grad_weights.clone()
+    grad_k = grad_k.clone()
+
+    import torch as _torch_cache
+    _torch_cache.cuda.empty_cache()
 
     return grad_q, grad_weights, grad_k

@@ -131,13 +131,20 @@ def cudnn_sparse_attn_bwd(
             topk_length=None,
         )
 
-    # Back to Paddle
+    # Back to Paddle — clone to move grads from torch allocator to paddle allocator.
+    # These grads persist as param.grad until optimizer step completes; keeping them
+    # in torch's cache would hide ~1.3GB from paddle's allocator.
     def _to_paddle(t):
-        return paddle.utils.dlpack.from_dlpack(_dlpack.to_dlpack(t))
+        view = paddle.utils.dlpack.from_dlpack(_dlpack.to_dlpack(t))
+        return view.clone()
 
     dq = _to_paddle(result["dq"]).reshape([B, S, H, D])
     dkv = _to_paddle(result["dkv"]).reshape([B, S_kv, D])
     d_sink = _to_paddle(result["d_sink"])
+
+    # Release torch tensor references so empty_cache can actually free them
+    del result
+    _torch.cuda.empty_cache()
 
     return dq, dkv, d_sink
 

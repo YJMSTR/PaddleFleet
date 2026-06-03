@@ -34,9 +34,33 @@ if _USE_FLASH_MLA:
         _flash_mla_sparse_fwd = None
 
 
+_torch_cuda_initialized = False
+
+
+def _ensure_torch_cuda_context():
+    """Pre-initialize torch's CUDA context so paddle's allocator sees reduced
+    available memory BEFORE making large allocations (optimizer states etc.).
+
+    FlashMLA is a torch CUDAExtension; importing it loads torch and the first
+    kernel launch initializes a ~724 MB CUDA context invisible to paddle.
+    Doing this early prevents OOM at optimizer step.
+    """
+    global _torch_cuda_initialized
+    if _torch_cuda_initialized:
+        return
+    _torch_cuda_initialized = True
+    import torch
+    if torch.cuda.is_available():
+        # Full init: CUDA context + cuBLAS + library state
+        _ = torch.empty(1, device="cuda")
+        del _
+        torch.cuda.empty_cache()
+
+
 def _load_flash_mla_sparse_fwd():
     global _flash_mla_sparse_fwd
     if _flash_mla_sparse_fwd is None:
+        _ensure_torch_cuda_context()
         from flash_mla import (
             flash_mla_sparse_fwd as _fn,
         )
