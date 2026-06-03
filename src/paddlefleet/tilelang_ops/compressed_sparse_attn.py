@@ -43,7 +43,7 @@ class CSASparseAttention(paddle.autograd.PyLayer):
             topk_idxs,
         )
         paddle.core.nvprof_nvtx_push(f"sparse_attn_fwd[{sparse_fwd_backend}]")
-        output, lse, lse_indexer = sparse_attn(
+        output, lse, lse_indexer, lse_kv_ln = sparse_attn(
             query,
             kv_full,
             attn_sink,
@@ -54,6 +54,7 @@ class CSASparseAttention(paddle.autograd.PyLayer):
         )
         paddle.core.nvprof_nvtx_pop()
         ctx.save_for_backward(query, kv_full, attn_sink, topk_idxs, output, lse)
+        ctx.lse_kv_ln = lse_kv_ln
         ctx.lse_indexer = lse_indexer
         CSASparseAttention._last_lse_indexer = lse_indexer
         return output.reshape([b, sq, np_heads * hn])
@@ -67,6 +68,37 @@ class CSASparseAttention(paddle.autograd.PyLayer):
         if ctx.sparse_bwd_backend == "cudnn":
             from paddlefleet.cudnn_ops import cudnn_sparse_attn_bwd
 
+            # cuDNN expects KV-only LSE (log2, excluding sink)
+            lse_for_cudnn = ctx.lse_kv_ln
+            if lse_for_cudnn is None:
+                # TileLang forward: convert full log2 LSE back to KV-only
+                import math
+                lse_full_ln = lse * math.log(2.0)
+                lse_for_cudnn = paddle.log(
+                    paddle.exp(lse_full_ln) - paddle.exp(attn_sink)
+                )
+
+            # DEBUG: check inputs for NaN before cuDNN call (first call only)
+            if not hasattr(CSASparseAttention, '_dbg_printed'):
+                CSASparseAttention._dbg_printed = True
+                _dbg_inputs = {
+                    "grad_output": grad_output, "query": query, "kv_full": kv_full,
+                    "attn_sink": attn_sink, "output": output, "lse_for_cudnn": lse_for_cudnn,
+                }
+                for _name, _t in _dbg_inputs.items():
+                    _nan = int(paddle.isnan(_t).sum())
+                    _inf = int(paddle.isinf(_t).sum())
+                    _numel = int(_t.numel())
+                    if _nan or _inf:
+                        _fp = _t.cast("float32")
+                        print(f"[CSA_BWD_DEBUG] {_name} shape={list(_t.shape)} dtype={_t.dtype} "
+                              f"nan={_nan}/{_numel} inf={_inf}/{_numel} "
+                              f"min={float(_fp.min()):.6g} max={float(_fp.max()):.6g}", flush=True)
+                    else:
+                        _fp = _t.cast("float32")
+                        print(f"[CSA_BWD_DEBUG] {_name} shape={list(_t.shape)} dtype={_t.dtype} OK "
+                              f"min={float(_fp.min()):.6g} max={float(_fp.max()):.6g}", flush=True)
+
             paddle.core.nvprof_nvtx_push("sparse_attn_bwd[cudnn]")
             dq, dkv, d_attn_sink = cudnn_sparse_attn_bwd(
                 grad_output,
@@ -75,10 +107,16 @@ class CSASparseAttention(paddle.autograd.PyLayer):
                 attn_sink,
                 topk_idxs,
                 output,
-                lse,
+                lse_for_cudnn,
                 ctx.softmax_scale,
             )
             paddle.core.nvprof_nvtx_pop()
+
+            # DEBUG: check outputs for NaN after cuDNN call
+            _dbg_outputs = {"dq": dq, "dkv": dkv, "d_attn_sink": d_attn_sink}
+            for _name, _t in _dbg_outputs.items():
+                if paddle.isnan(_t).any() or paddle.isinf(_t).any():
+                    print(f"[CSA_BWD_DEBUG] NaN/Inf in OUTPUT {_name}, shape={_t.shape}", flush=True)
         else:
             paddle.core.nvprof_nvtx_push("sparse_attn_bwd[tilelang]")
             dq, dkv, d_attn_sink = sparse_mqa_bwd.sparse_mqa_bwd_interface(

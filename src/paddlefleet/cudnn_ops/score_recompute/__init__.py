@@ -12,37 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""cuDNN sparse attention score recompute (target) via DLPack bridge.
+"""Sparse attention score recompute (target) for indexer KL loss.
 
-Wraps cudnn.DSA.sparse_attn_score_recompute_wrapper to compute the L1-normalised
-head-summed softmax target distribution used by the indexer KL loss.
+Computes the L1-normalised head-summed softmax target distribution:
+    P[b,q,h,i] = exp(Q_h . K_{topk[i]}^T * scale - LSE[b,q,h])
+    target[b,q,i] = sum_h(P[b,q,h,i]) / sum_i(sum_h(P[b,q,h,i]))
 """
 
 import paddle
-
-_DSA = None
-_torch = None
-
-
-def _ensure_cudnn_dsa():
-    global _DSA, _torch
-    if _DSA is not None:
-        return
-    import torch
-
-    _torch = torch
-    from cudnn import DSA
-
-    _DSA = DSA
-
-
-def _paddle_to_torch(x):
-    _ensure_cudnn_dsa()
-    return _torch.utils.dlpack.from_dlpack(x)
-
-
-def _torch_to_paddle(t):
-    return paddle.utils.dlpack.from_dlpack(t)
+import paddle.nn.functional as F
 
 
 def cudnn_attn_target_recompute(
@@ -53,7 +31,7 @@ def cudnn_attn_target_recompute(
     softmax_scale,
     qhead_per_kv_head=None,
 ):
-    """Compute L1-normalised attention target via cuDNN SparseAttnScoreRecompute.
+    """Compute L1-normalised attention target (pure Paddle).
 
     Args:
         q_attn: [B, S_q, H_q, D] bf16 Paddle tensor. MLA queries.
@@ -61,28 +39,40 @@ def cudnn_attn_target_recompute(
         lse: [B, S_q, H_q] fp32 Paddle tensor. Log-sum-exp from attn forward.
         topk_indices: [B, S_q, topk] int32 Paddle tensor. Per-batch local KV ids.
         softmax_scale: float. Attention softmax scale.
-        qhead_per_kv_head: int or None. Number of query heads per KV head.
+        qhead_per_kv_head: int or None. (unused, kept for API compat)
 
     Returns:
         target: [B, S_q, topk] fp32 Paddle tensor. L1-normalised target.
     """
-    _ensure_cudnn_dsa()
+    B, S, H, D = q_attn.shape
+    TOPK = topk_indices.shape[-1]
 
-    q_t = _paddle_to_torch(q_attn.contiguous())
-    k_t = _paddle_to_torch(k_attn.contiguous())
-    lse_t = _paddle_to_torch(lse.contiguous())
-    idx_t = _paddle_to_torch(topk_indices.contiguous())
+    query = q_attn.cast("float32")
+    key_comp = k_attn.cast("float32")
 
-    if qhead_per_kv_head is None:
-        qhead_per_kv_head = int(q_attn.shape[2])
+    # Gather keys at topk positions (mask invalid with 0-index)
+    valid = topk_indices >= 0
+    safe_idx = paddle.where(valid, topk_indices, paddle.zeros_like(topk_indices))
+    safe_flat = safe_idx.reshape([B, S * TOPK]).cast("int64")
+    gathered_k = paddle.take_along_axis(
+        key_comp, safe_flat.unsqueeze(-1).expand([B, S * TOPK, D]), axis=1
+    ).reshape([B, S, TOPK, D])
 
-    result = _DSA.sparse_attn_score_recompute_wrapper(
-        q_t,
-        k_t,
-        lse_t,
-        idx_t,
-        float(softmax_scale),
-        qhead_per_kv_head=qhead_per_kv_head,
-    )
-    target = _torch_to_paddle(result["target"])
+    # logits = Q . K^T * scale
+    logits = paddle.einsum("bshd,bstd->bsht", query, gathered_k) * softmax_scale
+
+    # Mask invalid positions
+    valid_4d = valid.unsqueeze(2).expand([B, S, H, TOPK])
+    neg_inf = paddle.full([1], float("-inf"), dtype="float32")
+    logits = paddle.where(valid_4d, logits, neg_inf)
+
+    # per_head_score = exp(logits - lse)
+    per_head_score = paddle.exp(logits - lse.unsqueeze(-1))
+    per_head_score = paddle.where(valid_4d, per_head_score, paddle.zeros_like(per_head_score))
+
+    # L1-normalize across topk dim
+    head_sum = per_head_score.sum(axis=2)  # [B, S, TOPK]
+    row_sum = head_sum.sum(axis=-1, keepdim=True).clip(min=1e-10)
+    target = head_sum / row_sum
+    target = paddle.where(valid, target, paddle.zeros_like(target))
     return target

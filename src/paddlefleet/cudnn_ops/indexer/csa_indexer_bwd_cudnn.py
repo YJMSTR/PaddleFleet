@@ -80,7 +80,7 @@ def _paddle_to_torch(t: paddle.Tensor):
         t = t.contiguous()
     # paddle.Tensor implements __dlpack__ (PEP 3118); torch.from_dlpack
     # accepts either a capsule or an object with __dlpack__.
-    return torch.from_dlpack(t)
+    return torch.from_dlpack(t.detach())
 
 
 def _torch_to_paddle(t) -> paddle.Tensor:

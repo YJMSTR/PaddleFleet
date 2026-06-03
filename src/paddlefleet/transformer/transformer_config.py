@@ -1098,20 +1098,20 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "csa_tilelang_enable_sparse_attn=True requires csa_tilelang_backend='attention_paddle_compat'."
                 )
-            if self.csa_indexer_backend not in {"tilelang", "cudnn"}:
+            if self.csa_indexer_backend not in {"paddle", "tilelang", "cudnn"}:
                 raise ValueError(
                     f"csa_indexer_backend={self.csa_indexer_backend!r} is invalid. "
-                    "Must be one of {'tilelang', 'cudnn'}."
+                    "Must be one of {'paddle', 'tilelang', 'cudnn'}."
                 )
-            if self.csa_sparse_fwd_backend not in {"tilelang", "flashmla"}:
+            if self.csa_sparse_fwd_backend not in {"paddle", "tilelang", "flashmla"}:
                 raise ValueError(
                     f"csa_sparse_fwd_backend={self.csa_sparse_fwd_backend!r} is invalid. "
-                    "Must be one of {'tilelang', 'flashmla'}."
+                    "Must be one of {'paddle', 'tilelang', 'flashmla'}."
                 )
-            if self.csa_sparse_bwd_backend not in {"tilelang", "cudnn"}:
+            if self.csa_sparse_bwd_backend not in {"paddle", "tilelang", "cudnn"}:
                 raise ValueError(
                     f"csa_sparse_bwd_backend={self.csa_sparse_bwd_backend!r} is invalid. "
-                    "Must be one of {'tilelang', 'cudnn'}."
+                    "Must be one of {'paddle', 'tilelang', 'cudnn'}."
                 )
 
         # Hash-based MoE routing consistency checks.

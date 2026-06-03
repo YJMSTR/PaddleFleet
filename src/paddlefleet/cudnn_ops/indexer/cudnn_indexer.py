@@ -54,7 +54,7 @@ def _ensure_cudnn_dsa():
 def _paddle_to_torch(x):
     """Zero-copy Paddle GPU tensor -> torch tensor via DLPack."""
     _ensure_cudnn_dsa()
-    return _torch.utils.dlpack.from_dlpack(x)
+    return _torch.utils.dlpack.from_dlpack(x.detach())
 
 
 def _torch_to_paddle(t):
@@ -138,7 +138,10 @@ def cudnn_indexer_forward(index_q, index_k_comp, weights, ratio=4):
     k_4d = index_k_comp.unsqueeze(2)  # [B, S_k, 1, D]
     k_t = _paddle_to_torch(k_4d.contiguous())
     w_t = _paddle_to_torch(weights.contiguous())
-    result = _DSA.indexer_forward_wrapper(q_t, k_t, w_t, ratio=int(ratio))
+    cur_stream_handle = paddle.device.cuda.current_stream().cuda_stream
+    torch_stream = _torch.cuda.ExternalStream(cur_stream_handle)
+    with _torch.cuda.stream(torch_stream):
+        result = _DSA.indexer_forward_wrapper(q_t, k_t, w_t, ratio=int(ratio))
     scores_t = result["scores"]
     scores = _torch_to_paddle(scores_t)
 
@@ -171,9 +174,12 @@ def cudnn_indexer_topk(scores, sq, ratio, topk):
     valid_per_q = ((q_idx + 1) // int(ratio)).clamp(max=sk).to(_torch.int32)
     seq_lens = valid_per_q.repeat(b)
 
-    tk_result = _DSA.indexer_top_k_wrapper(
-        scores_flat_t, seq_lens, top_k=topk_k, next_n=1, return_val=False
-    )
+    cur_stream_handle = paddle.device.cuda.current_stream().cuda_stream
+    torch_stream = _torch.cuda.ExternalStream(cur_stream_handle)
+    with _torch.cuda.stream(torch_stream):
+        tk_result = _DSA.indexer_top_k_wrapper(
+            scores_flat_t, seq_lens, top_k=topk_k, next_n=1, return_val=False
+        )
     topk_indices_t = tk_result["indices"]
     topk_indices = _torch_to_paddle(topk_indices_t).reshape(
         [b, int(sq), topk_k]

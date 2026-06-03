@@ -149,6 +149,7 @@ def flash_mla_sparse_attn(
 def sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=None, use_flashmla=None, indexer_topk: int = 0):
     q, kv, attn_sink, topk_idxs = _prepare_inputs(q, kv, attn_sink, topk_idxs)
     lse_indexer = None
+    lse_kv_ln = None
 
     if use_flashmla if use_flashmla is not None else _USE_FLASH_MLA:
         out, lse, lse_indexer = flash_mla_sparse_attn(
@@ -159,6 +160,8 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=None, use_flashmla=None, i
             sm_scale=sm_scale,
             indexer_topk=indexer_topk,
         )
+        # Save KV-only natural-log LSE for cuDNN backward before conversion
+        lse_kv_ln = lse
         # Convert FlashMLA log-e KV-only LSE to TileLang log2 LSE with sink.
         lse = paddle.logaddexp(lse, attn_sink) / math.log(2.0)
     else:
@@ -171,4 +174,4 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=None, use_flashmla=None, i
             f"TileLang must return Paddle tensors, got output={type(out)!r}, lse={type(lse)!r}. "
             "Ensure paddle.enable_compat(scope={'tilelang'}) runs before import tilelang."
         )
-    return out, lse, lse_indexer
+    return out, lse, lse_indexer, lse_kv_ln

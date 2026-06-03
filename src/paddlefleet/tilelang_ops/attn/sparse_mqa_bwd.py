@@ -311,7 +311,7 @@ def bwd(
 def sparse_mqa_bwd_interface(
     q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=None
 ):
-    """Backward interface for DSv4 sparse MQA attention.
+    """Backward interface for DSv4 sparse MQA attention (TileLang path).
 
     Args:
         q:         [B, S, H, D] bf16
@@ -341,7 +341,9 @@ def sparse_mqa_bwd_interface(
     topk = topk_idxs.shape[-1]
 
     # Pad topk to next multiple of block_size (kernel requires divisibility)
-    block_size = 32
+    # SM-aware alignment: SM90=128, SM100=64
+    gpu_props = paddle.device.get_device_properties("gpu:0")
+    block_size = 64 if gpu_props.major >= 10 else 128
     padded_topk = (topk + block_size - 1) // block_size * block_size
     if padded_topk != topk:
         pad = paddle.full([B, S, padded_topk - topk], -1, dtype=topk_idxs.dtype)

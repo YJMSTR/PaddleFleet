@@ -14,7 +14,15 @@
 
 """cuDNN frontend ops bridged into PaddleFleet via dlpack."""
 
-__all__ = ["cudnn_indexer_topk_fwd", "csa_indexer_bwd", "cudnn_sparse_attn_bwd", "cudnn_attn_target_recompute"]
+__all__ = [
+    "cudnn_indexer_topk_fwd",
+    "csa_indexer_bwd",
+    "cudnn_sparse_attn_bwd",
+    "cudnn_attn_target_recompute",
+    "sparse_attention_backward",
+    "is_cudnn_dsa_available",
+    "set_cudnn_dsa_enabled",
+]
 
 
 def __getattr__(name):
@@ -38,4 +46,19 @@ def __getattr__(name):
 
         globals()[name] = cudnn_attn_target_recompute
         return cudnn_attn_target_recompute
+    if name == "sparse_attention_backward":
+        from .sparse_attn import cudnn_sparse_attn_bwd
+
+        globals()[name] = cudnn_sparse_attn_bwd
+        return cudnn_sparse_attn_bwd
+    if name == "is_cudnn_dsa_available":
+        from .sparse_attn import is_cudnn_dsa_available
+
+        globals()[name] = is_cudnn_dsa_available
+        return is_cudnn_dsa_available
+    if name == "set_cudnn_dsa_enabled":
+        from .sparse_attn import set_cudnn_dsa_enabled
+
+        globals()[name] = set_cudnn_dsa_enabled
+        return set_cudnn_dsa_enabled
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -14,7 +14,7 @@
 
 import paddle
 
-paddle.enable_compat(scope={"tilelang"}, silent=True)
+paddle.enable_compat(scope={"tilelang", "flash_mla"}, silent=True)
 
 __all__ = [
     "csa_attn_target_reducesum",
