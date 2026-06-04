@@ -14,9 +14,14 @@
 
 # Refer to https://github.com/radixark/miles/pull/1045/
 
+import warnings
+
 import paddle
 import tilelang
 from tilelang import language as T
+
+
+_SPARSE_MQA_BWD_DETERMINISTIC_WARNING_EMITTED = False
 
 
 @tilelang.jit(out_idx=[-1])
@@ -330,12 +335,18 @@ def sparse_mqa_bwd_interface(
     """
     assert q.is_contiguous() and kv.is_contiguous()
     assert topk_idxs.is_contiguous() and lse.is_contiguous()
+    global _SPARSE_MQA_BWD_DETERMINISTIC_WARNING_EMITTED
     deterministic = paddle.get_flags(["FLAGS_cudnn_deterministic"])[
         "FLAGS_cudnn_deterministic"
     ]
-    assert not deterministic, (
-        "sparse_mqa_bwd_interface does not support deterministic.",
-    )
+    if deterministic and not _SPARSE_MQA_BWD_DETERMINISTIC_WARNING_EMITTED:
+        warnings.warn(
+            "sparse_mqa_bwd_interface uses a non-deterministic TileLang operator "
+            "even when FLAGS_cudnn_deterministic is enabled.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        _SPARSE_MQA_BWD_DETERMINISTIC_WARNING_EMITTED = True
     B, S, H, D = q.shape
     _, S_kv, _ = kv.shape
     topk = topk_idxs.shape[-1]
