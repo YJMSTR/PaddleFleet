@@ -105,14 +105,21 @@ def _validate_topk_and_grad(index_q, topk_indices, grad_scores):
         raise ValueError("topk_indices last dimension must be positive")
 
 
-def _prepare_forward_inputs(index_q, index_k_comp, weights, topk_effective):
+def _prepare_forward_inputs(
+    index_q,
+    index_k_comp,
+    weights,
+    topk_effective,
+    indexer_softmax_scale: float = 1.0,
+):
     _validate_indexer_inputs(index_q, index_k_comp, weights)
     if int(topk_effective) <= 0:
         raise ValueError(
             f"topk_effective must be positive, got {topk_effective}"
         )
-    if weights.dtype != paddle.float32:
-        weights = weights.cast("float32")
+    weights = (weights.cast("float32") * float(indexer_softmax_scale)).cast(
+        index_q.dtype
+    )
     return (
         index_q.contiguous(),
         index_k_comp.contiguous(),
@@ -130,8 +137,8 @@ def _prepare_backward_inputs(
         topk_indices = topk_indices.cast("int32")
     if grad_scores.dtype != paddle.float32:
         grad_scores = grad_scores.cast("float32")
-    if weights.dtype != paddle.float32:
-        weights = weights.cast("float32")
+    if weights.dtype != index_q.dtype:
+        weights = weights.cast(index_q.dtype)
 
     topk_indices = topk_indices.contiguous()
     grad_scores = paddle.where(
@@ -155,6 +162,7 @@ def csa_indexer_topk_fwd(
     block_K: int = DEFAULT_INDEXER_BLOCK,
     num_stages: int = 0,
     num_threads: int = 128,
+    indexer_softmax_scale: float = 1.0,
 ):
     """Paddle entry for V4 CSA compressed indexer forward.
 
@@ -169,6 +177,8 @@ def csa_indexer_topk_fwd(
             - Phase 3 (dsa_indexer_use_sparse_loss=True): set to
               min(index_topk, n_compressed), typically 512.
         block_K: tile size for streaming over compressed keys (default 32).
+        indexer_softmax_scale: additional Megatron-style scale applied as
+            ``(weights.float() * scale).to(index_q.dtype)`` before the kernel.
 
     Returns:
         topk_indices: [B, S, topk_effective] int32, invalid slots are -1.
@@ -179,6 +189,7 @@ def csa_indexer_topk_fwd(
         index_k_comp,
         weights,
         topk_effective,
+        indexer_softmax_scale=indexer_softmax_scale,
     )
     csa_indexer_topk_fwd_interface = _get_csa_indexer_topk_fwd_interface()
     topk_indices, topk_scores = csa_indexer_topk_fwd_interface(

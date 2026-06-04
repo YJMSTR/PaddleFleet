@@ -180,7 +180,7 @@ def tl_csa_indexer_bwd_impl(
     def tl_csa_indexer_bwd_kernel(
         IndexQ: T.Tensor(index_q_shape, dtype),
         IndexKComp: T.Tensor(index_k_shape, dtype),
-        Weights: T.Tensor(weights_shape, FP32),
+        Weights: T.Tensor(weights_shape, dtype),
         TopkIndices: T.Tensor(topk_indices_shape, INT32),
         OGrad: T.Tensor(grad_scores_shape, FP32),
         dIndexQ: T.Tensor(index_q_shape, dtype),
@@ -322,7 +322,7 @@ def csa_indexer_bwd_interface(
 
     Args:
         index_q: [B, S, H_i, D_i] bf16/fp16, BSHD layout.
-        weights: [B, S, H_i] fp32 or castable to fp32.
+        weights: [B, S, H_i] bf16/fp16 raw per-head weights.
         index_k_comp: [B, S_comp, D_i] bf16/fp16, BSD layout.
         topk_indices: [B, S, topk_effective] int32, invalid slots are -1.
         grad_scores: [B, S, topk_effective] fp32 OGrad for selected logits.
@@ -382,8 +382,8 @@ def csa_indexer_bwd_interface(
     grad_weights = paddle.empty_like(weights, dtype="float32")
     grad_k_comp = paddle.zeros_like(index_k_comp, dtype="float32")
 
-    if weights.dtype != paddle.float32:
-        weights = weights.cast("float32").contiguous()
+    if weights.dtype != index_q.dtype:
+        weights = weights.cast(index_q.dtype).contiguous()
     if grad_scores.dtype != paddle.float32:
         grad_scores = grad_scores.cast("float32").contiguous()
 

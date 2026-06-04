@@ -111,15 +111,18 @@ class CSASparseAttention(paddle.autograd.PyLayer):
         if ctx.sparse_bwd_backend == "cudnn":
             from paddlefleet.cudnn_ops import cudnn_sparse_attn_bwd
 
-            # cuDNN expects KV-only LSE (log2, excluding sink)
+            # cuDNN expects KV-only FP32 LSE excluding sink. FlashMLA provides
+            # it in natural-log form.
             lse_for_cudnn = ctx.lse_kv_ln
             if lse_for_cudnn is None:
                 # TileLang forward: convert full log2 LSE back to KV-only
                 import math
-                lse_full_ln = lse * math.log(2.0)
+                lse_full_ln = lse.cast("float32") * math.log(2.0)
                 lse_for_cudnn = paddle.log(
-                    paddle.exp(lse_full_ln) - paddle.exp(attn_sink)
+                    paddle.exp(lse_full_ln) - paddle.exp(attn_sink.cast("float32"))
                 )
+            elif lse_for_cudnn.dtype != paddle.float32:
+                lse_for_cudnn = lse_for_cudnn.cast("float32")
 
             paddle.core.nvprof_nvtx_push("sparse_attn_bwd[cudnn]")
             dq, dkv, d_attn_sink = cudnn_sparse_attn_bwd(

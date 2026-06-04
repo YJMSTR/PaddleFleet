@@ -463,6 +463,7 @@ def _compute_tilelang_csa_indexer_loss_forward(
     softmax_scale: float,
     loss_coeff: float,
     tp_group=None,
+    indexer_softmax_scale: float = 1.0,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     from paddlefleet.tilelang_ops import (
         csa_attn_target_reducesum,
@@ -475,6 +476,7 @@ def _compute_tilelang_csa_indexer_loss_forward(
         weights,
         ratio=int(ratio),
         topk_effective=int(topk_effective),
+        indexer_softmax_scale=float(indexer_softmax_scale),
     )
 
     if tp_group is not None and getattr(tp_group, "nranks", 1) > 1:
@@ -550,12 +552,12 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
         loss_coeff: float,
         tp_group=None,
         indexer_backend: str = "tilelang",
+        indexer_softmax_scale: float = 1.0,
     ) -> Tensor:
-        # The TileLang kernel applies its own ``dim**-0.5`` scale on index_q
-        # and consumes raw weights, so we pass them through unmodified. The
-        # PyLayer treats this as a single fused op: forward materializes only
-        # the selected ``[B,S,topk_effective]`` tensors and backward never
-        # touches the full ``[B,S,S_comp]`` logits.
+        # Match Megatron/cuDNN indexer fwd/topk semantics: apply the softmax
+        # scale by casting weights through fp32 and back to the indexer dtype
+        # before the TileLang kernel. Backward receives the raw saved weights
+        # and applies dim**-0.5 inside the TileLang backward kernel.
         loss, topk_indices, topk_probs, target = (
             _compute_tilelang_csa_indexer_loss_forward(
                 index_q,
@@ -568,6 +570,7 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
                 softmax_scale,
                 loss_coeff,
                 tp_group,
+                indexer_softmax_scale,
             )
         )
 
@@ -1320,6 +1323,7 @@ class CompressedSparseAttention(FleetLayer):
                 float(self.softmax_scale),
                 float(indexer_loss_coeff),
                 self.tp_group,
+                self.indexer.softmax_scale,
             )
             tilelang_indexer_loss_state = (
                 q_indexer_bf,
@@ -1440,9 +1444,12 @@ class CompressedSparseAttention(FleetLayer):
             with paddle.no_grad():
                 q_cu, k_cu, w_cu = self.indexer.forward_before_topk(x_det, qr_det)
                 cu_topk_indices, _ = cudnn_indexer_topk_fwd(
-                    q_cu, k_cu, w_cu,
+                    q_cu,
+                    k_cu,
+                    w_cu,
                     ratio=self.compress_ratio,
                     topk_effective=attn_topk_effective,
+                    indexer_softmax_scale=self.indexer.softmax_scale,
                 )
             topk_indices_compressed = cu_topk_indices
         elif not use_tilelang_indexer or indexer_backend == "paddle":
@@ -1466,6 +1473,7 @@ class CompressedSparseAttention(FleetLayer):
                     weights_indexer_tl,
                     ratio=self.compress_ratio,
                     topk_effective=attn_topk_effective,
+                    indexer_softmax_scale=self.indexer.softmax_scale,
                 )
 
             topk_indices_compressed = tl_topk_indices

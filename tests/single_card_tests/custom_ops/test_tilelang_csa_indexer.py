@@ -36,7 +36,7 @@ def _make_indexer_inputs(b, sq, sk, h_i, d_i, dtype="bfloat16", seed=2026):
     paddle.seed(seed)
     q = paddle.randn([b, sq, h_i, d_i]).astype(dtype)
     k = paddle.randn([b, sk, d_i]).astype(dtype)
-    w = paddle.randn([b, sq, h_i]).astype("float32")
+    w = paddle.randn([b, sq, h_i]).astype(dtype)
     return q, k, w
 
 
@@ -44,7 +44,7 @@ def _make_loss_inputs(b, sq, sk, h_i, d_i, np_, hn, seed=2027):
     paddle.seed(seed)
     q = paddle.randn([b, sq, h_i, d_i]).astype("bfloat16")
     k = paddle.randn([b, sk, d_i]).astype("bfloat16")
-    weights = paddle.randn([b, sq, h_i]).astype("float32")
+    weights = paddle.randn([b, sq, h_i]).astype("bfloat16")
     query_mla = paddle.randn([b, sq, np_, hn]).astype("bfloat16").detach()
     key_comp_mla = paddle.randn([b, sk, hn]).astype("bfloat16").detach()
     return q, k, weights, query_mla, key_comp_mla
@@ -91,14 +91,21 @@ def _assert_close(actual, expected, rtol, atol, msg):
 
 
 def _ref_csa_indexer_topk(
-    index_q, index_k_comp, weights, ratio, topk_effective
+    index_q,
+    index_k_comp,
+    weights,
+    ratio,
+    topk_effective,
+    indexer_softmax_scale=1.0,
 ):
+    scaled_weights = (
+        weights.cast("float32") * float(indexer_softmax_scale)
+    ).cast(index_q.dtype)
     scores = paddle.einsum(
         "bshd,btd->bsht", index_q.cast("float32"), index_k_comp.cast("float32")
     )
     scores = F.relu(scores)
-    scores = (scores * weights.cast("float32").unsqueeze(-1)).sum(axis=2)
-    scores = scores * (index_q.shape[-1] ** -0.5)
+    scores = (scores * scaled_weights.cast("float32").unsqueeze(-1)).sum(axis=2)
     batch, seq_len, seq_len_comp = scores.shape
     comp_ids = paddle.arange(seq_len_comp, dtype="int64").reshape(
         [1, 1, seq_len_comp]
@@ -151,12 +158,16 @@ def _ref_csa_indexer_topk(
     return topk_indices.cast("int32"), topk_probs.cast("float32")
 
 
-def _paddle_ref_csa_indexer_topk(q, k, weights, ratio, topk_effective):
+def _paddle_ref_csa_indexer_topk(
+    q, k, weights, ratio, topk_effective, indexer_softmax_scale=1.0
+):
     from paddlefleet.transformer.dsa_attention import fused_qk_topk_naive
 
     b, sq, h_i, d_i = q.shape
     sk = k.shape[1]
-    sm_scale = d_i**-0.5
+    scaled_weights = (
+        weights.cast("float32") * float(indexer_softmax_scale)
+    ).cast(q.dtype)
     comp_ids = paddle.arange(sk, dtype="int64").reshape([1, 1, sk])
     valid_end = (
         paddle.arange(1, sq + 1, dtype="int64").reshape([1, sq, 1]) // ratio
@@ -165,13 +176,11 @@ def _paddle_ref_csa_indexer_topk(q, k, weights, ratio, topk_effective):
     neg_inf = paddle.full([b, sq, sk], float("-inf"), dtype="float32")
     causal_mask = paddle.where(valid_mask, paddle.zeros_like(neg_inf), neg_inf)
     actual_topk = min(int(topk_effective), int(sk))
-    index_scores, ref_topk_indices = fused_qk_topk_naive(
-        q, k, weights, index_topk=actual_topk, mask=causal_mask
+    masked_scores, _ = fused_qk_topk_naive(
+        q, k, scaled_weights, index_topk=actual_topk, mask=causal_mask
     )
-    index_scores_scaled = index_scores * sm_scale
-    masked_scaled = index_scores_scaled + causal_mask
     topk_scores_raw, topk_indices = paddle.topk(
-        masked_scaled, k=actual_topk, axis=-1
+        masked_scores, k=actual_topk, axis=-1
     )
     topk_indices = paddle.clip(topk_indices, min=0, max=sk - 1)
     valid_topk = paddle.take_along_axis(
@@ -381,7 +390,7 @@ class TestTileLangCSAIndexerKernel(unittest.TestCase):
             atol=2e-2,
         )
         paddle.testing.assert_close(
-            out_dw.cpu(), ref_dw.cpu(), rtol=6e-2, atol=3e-2
+            out_dw.cpu(), ref_dw.cast("float32").cpu(), rtol=6e-2, atol=3e-2
         )
         paddle.testing.assert_close(
             out_dk.cpu(), ref_dk.cast("float32").cpu(), rtol=6e-2, atol=3e-2
@@ -586,6 +595,8 @@ class TestTileLangCSAIndexerLossGrad(unittest.TestCase):
             float(softmax_scale),
             float(loss_coeff),
             None,
+            "tilelang",
+            q.shape[-1] ** -0.5,
         )
         loss.backward()
         return loss, qd.grad, wd.grad, kd.grad
@@ -611,7 +622,8 @@ class TestTileLangCSAIndexerLossGrad(unittest.TestCase):
         q_sf.stop_gradient = False
         k_sf = k.detach().transpose([1, 0, 2]).clone()
         k_sf.stop_gradient = False
-        w_sf = (weights.detach() * alpha).transpose([1, 0, 2]).clone()
+        w_scaled = (weights.detach().cast("float32") * alpha).cast(weights.dtype)
+        w_sf = w_scaled.transpose([1, 0, 2]).clone()
         w_sf.stop_gradient = False
         query_sf = query_mla.transpose([1, 0, 2, 3]).detach()
         key_expanded = key_comp_mla.unsqueeze(2).expand(
@@ -874,7 +886,7 @@ class TestCSAAttnTargetReducesum(unittest.TestCase):
         h_i, d_i = 64, 128
         q = paddle.randn([b, sq, h_i, d_i]).astype("bfloat16")
         k = paddle.randn([b, sk, d_i]).astype("bfloat16")
-        w = paddle.randn([b, sq, h_i]).astype("float32")
+        w = paddle.randn([b, sq, h_i]).astype("bfloat16")
         query_mla = paddle.randn([b, sq, np_, hn]).astype("bfloat16").detach()
         # MLA invariant: compressed key is shared across all heads → [B, S_comp, D]
         key_comp_mla = (
@@ -1224,31 +1236,45 @@ class TestCSAIndexerInputValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             _prepare_forward_inputs(q, k, w, topk_effective=0)
 
-    def test_prepare_forward_inputs_casts_weights(self):
+    def test_prepare_forward_inputs_casts_weights_to_indexer_dtype(self):
         from paddlefleet.tilelang_ops.indexer.csa_indexer import (
             _prepare_forward_inputs,
         )
 
-        q = paddle.empty([1, 8, 16, 32])
-        k = paddle.empty([1, 4, 32])
-        w = paddle.empty([1, 8, 16], dtype="float16")  # not fp32
+        q = paddle.empty([1, 8, 16, 32], dtype="bfloat16")
+        k = paddle.empty([1, 4, 32], dtype="bfloat16")
+        w = paddle.empty([1, 8, 16], dtype="float32")
         _, _, w_out, _ = _prepare_forward_inputs(q, k, w, topk_effective=2)
-        self.assertEqual(w_out.dtype, paddle.float32)
+        self.assertEqual(w_out.dtype, q.dtype)
+
+    def test_prepare_forward_inputs_applies_scale_before_low_precision_cast(self):
+        from paddlefleet.tilelang_ops.indexer.csa_indexer import (
+            _prepare_forward_inputs,
+        )
+
+        q = paddle.empty([1, 1, 1, 1], dtype="bfloat16")
+        k = paddle.empty([1, 1, 1], dtype="bfloat16")
+        w = paddle.full([1, 1, 1], 8.0, dtype="float32")
+        _, _, w_out, _ = _prepare_forward_inputs(
+            q, k, w, topk_effective=1, indexer_softmax_scale=0.125
+        )
+        self.assertEqual(w_out.dtype, q.dtype)
+        self.assertEqual(float(w_out.cast("float32").item()), 1.0)
 
     def test_prepare_backward_inputs_casts_types(self):
         from paddlefleet.tilelang_ops.indexer.csa_indexer import (
             _prepare_backward_inputs,
         )
 
-        q = paddle.empty([1, 8, 16, 32])
-        k = paddle.empty([1, 4, 32])
-        w = paddle.empty([1, 8, 16], dtype="float16")
+        q = paddle.empty([1, 8, 16, 32], dtype="bfloat16")
+        k = paddle.empty([1, 4, 32], dtype="bfloat16")
+        w = paddle.empty([1, 8, 16], dtype="float32")
         topk = paddle.empty([1, 8, 2], dtype="int64")  # not int32
         grad = paddle.empty([1, 8, 2], dtype="float16")  # not fp32
         _, w_out, _, topk_out, grad_out = _prepare_backward_inputs(
             q, w, k, topk, grad
         )
-        self.assertEqual(w_out.dtype, paddle.float32)
+        self.assertEqual(w_out.dtype, q.dtype)
         self.assertEqual(topk_out.dtype, paddle.int32)
         self.assertEqual(grad_out.dtype, paddle.float32)
 
@@ -1661,7 +1687,7 @@ class TestTileLangCSAIndexerLossAutoScaler(unittest.TestCase):
         paddle.seed(5050)
         index_q = paddle.randn([b, sq, h_i, d_i]).astype("bfloat16")
         index_k_comp = paddle.randn([b, sk, d_i]).astype("bfloat16")
-        weights = paddle.randn([b, sq, h_i]).astype("float32")
+        weights = paddle.randn([b, sq, h_i]).astype("bfloat16")
 
         # Get topk and compute target to build the state tuple
         from paddlefleet.tilelang_ops import csa_indexer_topk_fwd

@@ -256,23 +256,29 @@ class TestCuDNNIndexerLossFuncBackward(unittest.TestCase):
         except Exception as exc:
             self.skipTest(f"cuDNN kernel error: {exc}")
 
-        # Leaf tensors that receive gradients
+        # Leaf tensors that receive gradients. Paddle PyLayer does not allow
+        # inplace strategy on leaf vars, so pass non-leaf identity views.
         q_leaf = index_q.detach().clone()
         q_leaf.stop_gradient = False
+        q_arg = q_leaf + 0
         w_leaf = weights.detach().clone()
         w_leaf.stop_gradient = False
+        w_arg = w_leaf + 0
         k_leaf = index_k.detach().clone()
         k_leaf.stop_gradient = False
+        k_arg = k_leaf + 0
 
-        output = paddle.randn([B, S, H * D]).cast("bfloat16")
-        output.stop_gradient = False
-        indexer_loss = paddle.to_tensor(0.123, dtype="float32")
-        indexer_loss.stop_gradient = False
+        output_leaf = paddle.randn([B, S, H * D]).cast("bfloat16")
+        output_leaf.stop_gradient = False
+        output = output_leaf + 0
+        indexer_loss_leaf = paddle.to_tensor(0.123, dtype="float32")
+        indexer_loss_leaf.stop_gradient = False
+        indexer_loss = indexer_loss_leaf + 0
 
         DSAIndexerLossAutoScaler.set_loss_scale(scale_tensor)
         result = CuDNNIndexerLossFunc.apply(
             output, indexer_loss,
-            q_leaf, w_leaf, k_leaf,
+            q_arg, w_arg, k_arg,
             pre_q, pre_w, pre_k,
         )
         result.backward(paddle.ones_like(result))
@@ -286,11 +292,11 @@ class TestCuDNNIndexerLossFuncBackward(unittest.TestCase):
                       name="PyLayer grad_k")
 
         # Output grad passes through unchanged
-        _assert_close(output.grad, paddle.ones_like(output), rtol=0, atol=0,
+        _assert_close(output_leaf.grad, paddle.ones_like(output_leaf), rtol=0.0, atol=0.0,
                       name="PyLayer grad_output")
 
         # indexer_loss receives scaled grad
-        self.assertAlmostEqual(indexer_loss.grad.item(), scale_val, places=5)
+        self.assertAlmostEqual(indexer_loss_leaf.grad.item(), scale_val, places=5)
         DSAIndexerLossAutoScaler.set_loss_scale(None)
 
     def test_pylayer_grads_vs_direct_bwd_call(self):
@@ -332,19 +338,24 @@ class TestCuDNNIndexerLossFuncBackward(unittest.TestCase):
         # PyLayer path
         q_leaf = index_q.detach().clone()
         q_leaf.stop_gradient = False
+        q_arg = q_leaf + 0
         w_leaf = weights.detach().clone()
         w_leaf.stop_gradient = False
+        w_arg = w_leaf + 0
         k_leaf = index_k.detach().clone()
         k_leaf.stop_gradient = False
-        output = paddle.randn([B, S, H * D]).cast("bfloat16")
-        output.stop_gradient = False
-        indexer_loss = paddle.to_tensor(0.0, dtype="float32")
-        indexer_loss.stop_gradient = False
+        k_arg = k_leaf + 0
+        output_leaf = paddle.randn([B, S, H * D]).cast("bfloat16")
+        output_leaf.stop_gradient = False
+        output = output_leaf + 0
+        indexer_loss_leaf = paddle.to_tensor(0.0, dtype="float32")
+        indexer_loss_leaf.stop_gradient = False
+        indexer_loss = indexer_loss_leaf + 0
 
         DSAIndexerLossAutoScaler.set_loss_scale(scale_tensor)
         result = CuDNNIndexerLossFunc.apply(
             output, indexer_loss,
-            q_leaf, w_leaf, k_leaf,
+            q_arg, w_arg, k_arg,
             pre_q, pre_w, pre_k,
         )
         result.backward(paddle.ones_like(result))

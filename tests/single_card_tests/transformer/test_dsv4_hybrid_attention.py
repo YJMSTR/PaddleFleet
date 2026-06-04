@@ -67,6 +67,9 @@ def _make_config(
     csa_tilelang_backend=None,
     csa_tilelang_enable_indexer=None,
     csa_tilelang_enable_sparse_attn=None,
+    csa_indexer_backend="paddle",
+    csa_sparse_fwd_backend="paddle",
+    csa_sparse_bwd_backend="paddle",
 ):
     if csa_compress_ratios is None:
         csa_compress_ratios = [0, 4, 128, 4]
@@ -110,6 +113,9 @@ def _make_config(
         csa_tilelang_backend=csa_tilelang_backend,
         csa_tilelang_enable_indexer=csa_tilelang_enable_indexer,
         csa_tilelang_enable_sparse_attn=csa_tilelang_enable_sparse_attn,
+        csa_indexer_backend=csa_indexer_backend,
+        csa_sparse_fwd_backend=csa_sparse_fwd_backend,
+        csa_sparse_bwd_backend=csa_sparse_bwd_backend,
     )
 
 
@@ -446,7 +452,7 @@ class TestDSv4HybridFusedSparseAttention(unittest.TestCase):
             query.stop_gradient = False
             kv_full.stop_gradient = False
             attn_sink.stop_gradient = False
-            fused_out = csa_sparse_attn(
+            fused_out, _ = csa_sparse_attn(
                 query, kv_full, attn_sink, topk_idxs, softmax_scale
             )
             fused_loss = fused_out.cast("float32").sum()

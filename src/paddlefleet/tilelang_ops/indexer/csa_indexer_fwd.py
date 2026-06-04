@@ -78,7 +78,6 @@ def tl_csa_indexer_topk_fwd_impl(
 
     N = 2 * topk
     num_iters = int(round(math.log2(N)))
-    sm_scale = dim**-0.5
 
     @T.macro
     def bitonic_sort(
@@ -113,7 +112,7 @@ def tl_csa_indexer_topk_fwd_impl(
     def tl_csa_indexer_topk_fwd_kernel(
         IndexQ: T.Tensor(index_q_shape, dtype),
         IndexKComp: T.Tensor(index_k_shape, dtype),
-        Weights: T.Tensor(weights_shape, FP32),
+        Weights: T.Tensor(weights_shape, dtype),
         TopkIndices: T.Tensor(topk_indices_shape, INT32),
         TopkScores: T.Tensor(topk_scores_shape, FP32),
     ):
@@ -134,10 +133,6 @@ def tl_csa_indexer_topk_fwd_impl(
 
             weights_shared = T.alloc_shared([heads], dtype=FP32)
             T.copy(Weights[i_b, i_t, :], weights_shared)
-            T.sync_threads()
-
-            for i, j in T.Parallel(heads, dim):
-                index_q_shared[i, j] = index_q_shared[i, j] * sm_scale
             T.sync_threads()
 
             num_blocks = T.ceildiv(valid_end, block_K)
@@ -334,7 +329,7 @@ def csa_indexer_topk_fwd_interface(
     Args:
         index_q: [B, S, H_i, D_i] bf16/fp16, BSHD layout.
         index_k_comp: [B, S_comp, D_i] bf16/fp16, BSD layout.
-        weights: [B, S, H_i] fp32 or castable to fp32.
+        weights: [B, S, H_i] bf16/fp16, already scaled by caller.
         ratio: compression ratio. Valid compressed range for query t is
             [0, (t + 1) // ratio).
         topk_effective: requested output top-k. Phase 2 may set this to
@@ -373,8 +368,8 @@ def csa_indexer_topk_fwd_interface(
     topk_indices = paddle.empty([batch, seq_len, padded_topk], dtype="int32")
     topk_scores = paddle.empty([batch, seq_len, padded_topk], dtype="float32")
 
-    if weights.dtype != paddle.float32:
-        weights = weights.cast("float32").contiguous()
+    if weights.dtype != index_q.dtype:
+        weights = weights.cast(index_q.dtype).contiguous()
 
     kernel(
         index_q,
