@@ -1459,8 +1459,12 @@ class CompressedSparseAttention(FleetLayer):
                 mask=causal_mask,
             )
 
-        # Optionally replace topk producer with an accelerated backend.
-        if indexer_backend != "paddle" and use_tilelang_indexer and not use_tilelang_loss_path:
+        # Optionally replace topk producer with the TileLang backend.
+        if (
+            indexer_backend not in ("paddle", "cudnn")
+            and use_tilelang_indexer
+            and not use_tilelang_loss_path
+        ):
             from paddlefleet.tilelang_ops import csa_indexer_topk_fwd
 
             with paddle.no_grad():
