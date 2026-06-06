@@ -25,6 +25,7 @@ Components:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -47,6 +48,15 @@ if TYPE_CHECKING:
     from paddlefleet.process_groups_config import ProcessGroupCollection
     from paddlefleet.transformer.enums import AttnMaskType
     from paddlefleet.transformer.transformer_config import TransformerConfig
+
+
+@contextmanager
+def _nvtx_range(name: str):
+    paddle.core.nvprof_nvtx_push(name)
+    try:
+        yield
+    finally:
+        paddle.core.nvprof_nvtx_pop()
 
 
 def _q_rms_norm(q: Tensor, eps: float) -> Tensor:
@@ -213,19 +223,21 @@ class DSv4HybridAttention(Attention):
             (output [b, sq, hidden_size], bias=None)
         """
         # Get Q, K, V tensors
-        query, key, value, q_compressed, kv_compressed = (
-            self.get_query_key_value_tensors(hidden_states)
-        )
+        with _nvtx_range("dsv4_attn/qkv_projection"):
+            query, key, value, q_compressed, kv_compressed = (
+                self.get_query_key_value_tensors(hidden_states)
+            )
 
         # Core attention (CompressedSparseAttention)
-        core_attn_out = self.core_attention(
-            query,
-            key,
-            value,
-            attention_mask,
-            x=hidden_states,
-            qr=q_compressed,
-        )
+        with _nvtx_range("dsv4_attn/core_csa_attention"):
+            core_attn_out = self.core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                x=hidden_states,
+                qr=q_compressed,
+            )
         # core_attn_out: [b, sq, np * v_head_dim]
 
         # Inverse RoPE on last qk_pos_emb_head_dim of each head
@@ -234,43 +246,46 @@ class DSv4HybridAttention(Attention):
         nope_dim = self.v_head_dim - pos_dim
 
         if pos_dim > 0:
-            core_attn_out = core_attn_out.reshape(
-                [b, sq, self.num_attention_heads, self.v_head_dim]
-            )
-            # Get RoPE frequencies for inverse
-            _rope_result = self.rotary_pos_emb(sq, packed_seq=False)
-            if isinstance(_rope_result, tuple):
-                freqs, mscale = _rope_result
-            else:
-                freqs, mscale = _rope_result, 1.0
+            with _nvtx_range("dsv4_attn/inverse_rope"):
+                core_attn_out = core_attn_out.reshape(
+                    [b, sq, self.num_attention_heads, self.v_head_dim]
+                )
+                # Get RoPE frequencies for inverse
+                _rope_result = self.rotary_pos_emb(sq, packed_seq=False)
+                if isinstance(_rope_result, tuple):
+                    freqs, mscale = _rope_result
+                else:
+                    freqs, mscale = _rope_result, 1.0
 
-            content_part = core_attn_out[..., :nope_dim]
-            rot_part = core_attn_out[..., nope_dim:]
+                content_part = core_attn_out[..., :nope_dim]
+                rot_part = core_attn_out[..., nope_dim:]
 
-            rot_part = _apply_rotary_pos_emb_bshd(
-                rot_part,
-                freqs,
-                mscale=mscale,
-                rotary_interleaved=False,
-                multi_latent_attention=True,
-                inverse=True,
-                mla_output_remove_interleaving=True,
-            )
-            core_attn_out = paddle.concat([content_part, rot_part], axis=-1)
-            core_attn_out = core_attn_out.reshape([b, sq, -1])
+                rot_part = _apply_rotary_pos_emb_bshd(
+                    rot_part,
+                    freqs,
+                    mscale=mscale,
+                    rotary_interleaved=False,
+                    multi_latent_attention=True,
+                    inverse=True,
+                    mla_output_remove_interleaving=True,
+                )
+                core_attn_out = paddle.concat([content_part, rot_part], axis=-1)
+                core_attn_out = core_attn_out.reshape([b, sq, -1])
 
         # Grouped output projection
-        core_attn_out = core_attn_out.reshape([b, sq, self.o_local_groups, -1])
-        wo_a_weight = self.linear_o_group_proj.reshape(
-            [self.o_local_groups, self.config.o_lora_rank, -1]
-        )
-        core_attn_out = paddle.einsum(
-            "...gd,grd->...gr", core_attn_out, wo_a_weight
-        )
-        core_attn_out = core_attn_out.reshape([b, sq, -1])
+        with _nvtx_range("dsv4_attn/grouped_o_proj"):
+            core_attn_out = core_attn_out.reshape([b, sq, self.o_local_groups, -1])
+            wo_a_weight = self.linear_o_group_proj.reshape(
+                [self.o_local_groups, self.config.o_lora_rank, -1]
+            )
+            core_attn_out = paddle.einsum(
+                "...gd,grd->...gr", core_attn_out, wo_a_weight
+            )
+            core_attn_out = core_attn_out.reshape([b, sq, -1])
 
         # Output projection
-        output, bias = self.o_proj(core_attn_out)
+        with _nvtx_range("dsv4_attn/output_projection"):
+            output, bias = self.o_proj(core_attn_out)
 
         return output, bias
 

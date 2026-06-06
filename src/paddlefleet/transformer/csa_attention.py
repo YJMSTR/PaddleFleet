@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import functools
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -53,44 +54,22 @@ if TYPE_CHECKING:
     from paddlefleet.transformer.transformer_config import TransformerConfig
 
 
-_CSA_MEMORY_DEBUG = os.getenv("CSA_MEMORY_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
-_CSA_MEMORY_DEBUG_RANK = int(os.getenv("CSA_MEMORY_DEBUG_RANK", "0"))
-
-
-def _csa_memory_debug_enabled() -> bool:
-    if not _CSA_MEMORY_DEBUG:
-        return False
+@contextmanager
+def _nvtx_range(name: str):
+    paddle.core.nvprof_nvtx_push(name)
     try:
-        return paddle.distributed.get_rank() == _CSA_MEMORY_DEBUG_RANK
-    except Exception:
-        return True
+        yield
+    finally:
+        paddle.core.nvprof_nvtx_pop()
 
 
-def _csa_mem_gb(fn) -> float:
-    try:
-        return float(fn()) / (1024**3)
-    except Exception:
-        return 0.0
-
-
-def _csa_log_memory(tag: str, layer_number=None):
-    if not _csa_memory_debug_enabled():
-        return
-    try:
-        paddle.device.synchronize()
-    except Exception:
-        pass
-    prefix = f"[CSA_MEM] {tag}"
-    if layer_number is not None:
-        prefix += f" layer={layer_number}"
-    print(
-        f"{prefix} "
-        f"alloc={_csa_mem_gb(paddle.device.memory_allocated):.3f}GB "
-        f"reserved={_csa_mem_gb(paddle.device.memory_reserved):.3f}GB "
-        f"max_alloc={_csa_mem_gb(paddle.device.max_memory_allocated):.3f}GB "
-        f"max_reserved={_csa_mem_gb(paddle.device.max_memory_reserved):.3f}GB",
-        flush=True,
-    )
+@contextmanager
+def _nsys_capture_range(name: str, enabled: bool = True):
+    if enabled:
+        with _nvtx_range(name):
+            yield
+    else:
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -479,17 +458,18 @@ def _compute_tilelang_csa_indexer_loss_forward(
         indexer_softmax_scale=float(indexer_softmax_scale),
     )
 
-    if tp_group is not None and getattr(tp_group, "nranks", 1) > 1:
-        target = _compute_attn_target_on_selected_set(
-            query_mla, key_comp_mla, topk_indices, softmax_scale, tp_group
-        )
-    else:
-        target = csa_attn_target_reducesum(
-            query_mla,
-            key_comp_mla,
-            topk_indices,
-            softmax_scale,
-        )
+    with _nvtx_range("csa_indexer_target_reducesum[tilelang]"):
+        if tp_group is not None and getattr(tp_group, "nranks", 1) > 1:
+            target = _compute_attn_target_on_selected_set(
+                query_mla, key_comp_mla, topk_indices, softmax_scale, tp_group
+            )
+        else:
+            target = csa_attn_target_reducesum(
+                query_mla,
+                key_comp_mla,
+                topk_indices,
+                softmax_scale,
+            )
 
     eps = 1e-10
     kl_per_elem = target * (
@@ -606,7 +586,7 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
             # precompute internally and multiplies the result by ``grad_loss``
             # in the GEMM kernel. ``num_rows == B * Sq`` matches cuDNN's
             # built-in ``grad_scale = loss_coeff / (B*Sq)``.
-            paddle.core.nvprof_nvtx_push("cudnn_indexer_bwd")
+            paddle.core.nvprof_nvtx_push("csa_indexer_bwd[cudnn]")
             grad_q, grad_weights, grad_k = csa_indexer_bwd(
                 index_q,
                 weights,
@@ -627,13 +607,14 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
             if grad_loss is not None:
                 grad_index_scores = grad_index_scores * grad_loss
 
-            grad_q, grad_weights, grad_k = csa_indexer_bwd(
-                index_q,
-                weights,
-                index_k_comp,
-                topk_indices,
-                grad_index_scores,
-            )
+            with _nvtx_range("csa_indexer_bwd[tilelang]"):
+                grad_q, grad_weights, grad_k = csa_indexer_bwd(
+                    index_q,
+                    weights,
+                    index_k_comp,
+                    topk_indices,
+                    grad_index_scores,
+                )
         else:
             raise NotImplementedError(
                 f"CSA indexer backend {ctx.indexer_backend!r} not implemented."
@@ -715,7 +696,7 @@ class TileLangCSAIndexerLossAutoScaler(paddle.autograd.PyLayer):
             else:
                 grad_loss_arg = paddle.to_tensor(float(scale), dtype=paddle.float32)
 
-            paddle.core.nvprof_nvtx_push("cudnn_indexer_bwd")
+            paddle.core.nvprof_nvtx_push("csa_indexer_bwd[cudnn]")
             grad_q, grad_weights, grad_k = csa_indexer_bwd(
                 index_q,
                 weights,
@@ -736,13 +717,14 @@ class TileLangCSAIndexerLossAutoScaler(paddle.autograd.PyLayer):
             if scale is not None:
                 grad_index_scores = grad_index_scores * scale
 
-            grad_q, grad_weights, grad_k = csa_indexer_bwd(
-                index_q,
-                weights,
-                index_k_comp,
-                topk_indices,
-                grad_index_scores,
-            )
+            with _nvtx_range("csa_indexer_bwd[tilelang]"):
+                grad_q, grad_weights, grad_k = csa_indexer_bwd(
+                    index_q,
+                    weights,
+                    index_k_comp,
+                    topk_indices,
+                    grad_index_scores,
+                )
         else:
             raise NotImplementedError(
                 f"CSA indexer backend {ctx.indexer_backend!r} not implemented."
@@ -1248,7 +1230,6 @@ class CompressedSparseAttention(FleetLayer):
         b, sq, np_heads, _ = query.shape
         indexer_loss = None
         tilelang_indexer_loss_state = None
-        _csa_log_memory("indexer_topk_begin", self.layer_number)
 
         x_det = x.detach()
         qr_det = qr.detach()
@@ -1301,30 +1282,32 @@ class CompressedSparseAttention(FleetLayer):
             indexer_loss_coeff = getattr(
                 self.config, "dsa_indexer_loss_coeff", 0.0
             )
-            q_indexer_bf, k_indexer_bf, weights_indexer_bf = (
-                self.indexer.forward_before_topk(x_det, qr_det)
-            )
+            with _nvtx_range("csa_indexer_forward_before_topk[tilelang]"):
+                q_indexer_bf, k_indexer_bf, weights_indexer_bf = (
+                    self.indexer.forward_before_topk(x_det, qr_det)
+                )
             # compressed_kv is shared across query heads; pass it directly to
             # the target/reducesum path instead of materializing [B,S,H,D].
             key_comp_mla = compressed_kv.detach()
-            (
-                indexer_loss,
-                topk_indices_compressed,
-                topk_probs,
-                target,
-            ) = _compute_tilelang_csa_indexer_loss_forward(
-                q_indexer_bf,
-                weights_indexer_bf,
-                k_indexer_bf,
-                query.detach(),
-                key_comp_mla,
-                int(self.compress_ratio),
-                int(loss_topk_effective),
-                float(self.softmax_scale),
-                float(indexer_loss_coeff),
-                self.tp_group,
-                self.indexer.softmax_scale,
-            )
+            with _nvtx_range("csa_indexer_loss_forward[tilelang]"):
+                (
+                    indexer_loss,
+                    topk_indices_compressed,
+                    topk_probs,
+                    target,
+                ) = _compute_tilelang_csa_indexer_loss_forward(
+                    q_indexer_bf,
+                    weights_indexer_bf,
+                    k_indexer_bf,
+                    query.detach(),
+                    key_comp_mla,
+                    int(self.compress_ratio),
+                    int(loss_topk_effective),
+                    float(self.softmax_scale),
+                    float(indexer_loss_coeff),
+                    self.tp_group,
+                    self.indexer.softmax_scale,
+                )
             tilelang_indexer_loss_state = (
                 q_indexer_bf,
                 weights_indexer_bf,
@@ -1348,9 +1331,10 @@ class CompressedSparseAttention(FleetLayer):
         ):
             # cuDNN loss path: cuDNN indexer fwd/topk, tilelang target, cuDNN bwd.
             indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0)
-            q_indexer_cu, k_indexer_cu, weights_indexer_cu = (
-                self.indexer.forward_before_topk(x_det, qr_det)
-            )
+            with _nvtx_range("csa_indexer_forward_before_topk[cudnn]"):
+                q_indexer_cu, k_indexer_cu, weights_indexer_cu = (
+                    self.indexer.forward_before_topk(x_det, qr_det)
+                )
 
             if float(indexer_loss_coeff) <= 0.0:
                 from paddlefleet.cudnn_ops.indexer.cudnn_indexer import (
@@ -1358,14 +1342,15 @@ class CompressedSparseAttention(FleetLayer):
                 )
 
                 with paddle.no_grad():
-                    cu_topk_indices, _ = cudnn_indexer_topk_fwd(
-                        q_indexer_cu,
-                        k_indexer_cu,
-                        weights_indexer_cu,
-                        ratio=self.compress_ratio,
-                        topk_effective=attn_topk_effective,
-                        indexer_softmax_scale=self.indexer.softmax_scale,
-                    )
+                    with _nvtx_range("csa_indexer_topk_fwd[cudnn]"):
+                        cu_topk_indices, _ = cudnn_indexer_topk_fwd(
+                            q_indexer_cu,
+                            k_indexer_cu,
+                            weights_indexer_cu,
+                            ratio=self.compress_ratio,
+                            topk_effective=attn_topk_effective,
+                            indexer_softmax_scale=self.indexer.softmax_scale,
+                        )
                 topk_indices_compressed = cu_topk_indices
             else:
                 from paddlefleet.cudnn_ops.indexer.cudnn_indexer import (
@@ -1373,48 +1358,51 @@ class CompressedSparseAttention(FleetLayer):
                     cudnn_indexer_topk,
                 )
 
-                with paddle.no_grad():
-                    w_scaled = (
-                        weights_indexer_cu.cast("float32") * self.indexer.softmax_scale
-                    ).cast(weights_indexer_cu.dtype)
-                    indexer_scores = cudnn_indexer_forward(
-                        q_indexer_cu, k_indexer_cu, w_scaled, ratio=self.compress_ratio,
-                    )
-                    cu_topk_indices, _ = cudnn_indexer_topk(
-                        indexer_scores, sq, int(self.compress_ratio), int(loss_topk_effective),
-                    )
-                    _csa_log_memory("after_cudnn_indexer_forward_topk", self.layer_number)
+                with _nvtx_range("csa_indexer_loss_forward[cudnn]"):
+                    with paddle.no_grad():
+                        with _nvtx_range("csa_indexer_forward[cudnn]"):
+                            w_scaled = (
+                                weights_indexer_cu.cast("float32") * self.indexer.softmax_scale
+                            ).cast(weights_indexer_cu.dtype)
+                            indexer_scores = cudnn_indexer_forward(
+                                q_indexer_cu, k_indexer_cu, w_scaled, ratio=self.compress_ratio,
+                            )
+                        with _nvtx_range("csa_indexer_topk[cudnn]"):
+                            cu_topk_indices, _ = cudnn_indexer_topk(
+                                indexer_scores, sq, int(self.compress_ratio), int(loss_topk_effective),
+                            )
 
-                    # Gather topk scores → softmax → topk_probs
-                    safe_idx = paddle.clip(cu_topk_indices.cast("int64"), min=0)
-                    valid = cu_topk_indices >= 0
-                    topk_scores = paddle.take_along_axis(indexer_scores, safe_idx, axis=2)
-                    del indexer_scores
-                    topk_scores = paddle.where(valid, topk_scores, paddle.full_like(topk_scores, float("-inf")))
-                    topk_probs = F.softmax(topk_scores, axis=-1, dtype="float32")
-                    del topk_scores
-                    topk_probs = paddle.where(valid, topk_probs, paddle.zeros_like(topk_probs))
-                    _csa_log_memory("after_cudnn_topk_probs", self.layer_number)
+                        # Gather topk scores → softmax → topk_probs
+                        with _nvtx_range("csa_indexer_topk_probs[cudnn]"):
+                            safe_idx = paddle.clip(cu_topk_indices.cast("int64"), min=0)
+                            valid = cu_topk_indices >= 0
+                            topk_scores = paddle.take_along_axis(indexer_scores, safe_idx, axis=2)
+                            del indexer_scores
+                            topk_scores = paddle.where(valid, topk_scores, paddle.full_like(topk_scores, float("-inf")))
+                            topk_probs = F.softmax(topk_scores, axis=-1, dtype="float32")
+                            del topk_scores
+                            topk_probs = paddle.where(valid, topk_probs, paddle.zeros_like(topk_probs))
 
-                    # Compute target via tilelang fused kernel
-                    key_comp_mla = compressed_kv.detach()
-                    from paddlefleet.tilelang_ops import csa_attn_target_reducesum
-                    if self.tp_group is not None and getattr(self.tp_group, "nranks", 1) > 1:
-                        target = _compute_attn_target_on_selected_set(
-                            query, key_comp_mla, cu_topk_indices,
-                            float(self.softmax_scale), self.tp_group,
-                        )
-                    else:
-                        target = csa_attn_target_reducesum(
-                            query, key_comp_mla, cu_topk_indices,
-                            float(self.softmax_scale),
-                        )
+                        # Compute target via tilelang fused kernel
+                        key_comp_mla = compressed_kv.detach()
+                        from paddlefleet.tilelang_ops import csa_attn_target_reducesum
+                        with _nvtx_range("csa_indexer_target_reducesum[tilelang]"):
+                            if self.tp_group is not None and getattr(self.tp_group, "nranks", 1) > 1:
+                                target = _compute_attn_target_on_selected_set(
+                                    query, key_comp_mla, cu_topk_indices,
+                                    float(self.softmax_scale), self.tp_group,
+                                )
+                            else:
+                                target = csa_attn_target_reducesum(
+                                    query, key_comp_mla, cu_topk_indices,
+                                    float(self.softmax_scale),
+                                )
 
-                    # KL loss (for logging only; backward uses csa_indexer_bwd)
-                    eps = 1e-10
-                    kl_per_elem = target * (paddle.log(target + eps) - paddle.log(topk_probs + eps))
-                    indexer_loss = kl_per_elem.sum(axis=-1).mean() * float(indexer_loss_coeff)
-                    _csa_log_memory("after_cudnn_target_loss", self.layer_number)
+                        # KL loss (for logging only; backward uses csa_indexer_bwd)
+                        with _nvtx_range("csa_indexer_kl_loss[cudnn]"):
+                            eps = 1e-10
+                            kl_per_elem = target * (paddle.log(target + eps) - paddle.log(topk_probs + eps))
+                            indexer_loss = kl_per_elem.sum(axis=-1).mean() * float(indexer_loss_coeff)
 
                 topk_indices_compressed = cu_topk_indices
 
@@ -1442,15 +1430,17 @@ class CompressedSparseAttention(FleetLayer):
             )
 
             with paddle.no_grad():
-                q_cu, k_cu, w_cu = self.indexer.forward_before_topk(x_det, qr_det)
-                cu_topk_indices, _ = cudnn_indexer_topk_fwd(
-                    q_cu,
-                    k_cu,
-                    w_cu,
-                    ratio=self.compress_ratio,
-                    topk_effective=attn_topk_effective,
-                    indexer_softmax_scale=self.indexer.softmax_scale,
-                )
+                with _nvtx_range("csa_indexer_forward_before_topk[cudnn_no_grad]"):
+                    q_cu, k_cu, w_cu = self.indexer.forward_before_topk(x_det, qr_det)
+                with _nvtx_range("csa_indexer_topk_fwd[cudnn_no_grad]"):
+                    cu_topk_indices, _ = cudnn_indexer_topk_fwd(
+                        q_cu,
+                        k_cu,
+                        w_cu,
+                        ratio=self.compress_ratio,
+                        topk_effective=attn_topk_effective,
+                        indexer_softmax_scale=self.indexer.softmax_scale,
+                    )
             topk_indices_compressed = cu_topk_indices
         elif not use_tilelang_indexer or indexer_backend == "paddle":
             _, topk_indices_compressed = self.indexer(
@@ -1468,17 +1458,19 @@ class CompressedSparseAttention(FleetLayer):
             from paddlefleet.tilelang_ops import csa_indexer_topk_fwd
 
             with paddle.no_grad():
-                q_indexer_tl, k_indexer_tl, weights_indexer_tl = (
-                    self.indexer.forward_before_topk(x_det, qr_det)
-                )
-                tl_topk_indices, _tl_topk_scores = csa_indexer_topk_fwd(
-                    q_indexer_tl,
-                    k_indexer_tl,
-                    weights_indexer_tl,
-                    ratio=self.compress_ratio,
-                    topk_effective=attn_topk_effective,
-                    indexer_softmax_scale=self.indexer.softmax_scale,
-                )
+                with _nvtx_range("csa_indexer_forward_before_topk[tilelang_no_loss]"):
+                    q_indexer_tl, k_indexer_tl, weights_indexer_tl = (
+                        self.indexer.forward_before_topk(x_det, qr_det)
+                    )
+                with _nvtx_range("csa_indexer_topk_fwd[tilelang]"):
+                    tl_topk_indices, _tl_topk_scores = csa_indexer_topk_fwd(
+                        q_indexer_tl,
+                        k_indexer_tl,
+                        weights_indexer_tl,
+                        ratio=self.compress_ratio,
+                        topk_effective=attn_topk_effective,
+                        indexer_softmax_scale=self.indexer.softmax_scale,
+                    )
 
             topk_indices_compressed = tl_topk_indices
 
@@ -1493,7 +1485,6 @@ class CompressedSparseAttention(FleetLayer):
             self.compress_ratio,
             offset,
         )
-        _csa_log_memory("indexer_topk_end", self.layer_number)
 
         return compress_topk_idxs, indexer_loss, tilelang_indexer_loss_state, topk_indices_compressed
 
@@ -1520,86 +1511,98 @@ class CompressedSparseAttention(FleetLayer):
             output: [b, sq, np * v_head_dim]
         """
         b, sq, np_heads, hn = query.shape
-        _csa_log_memory("csa_forward_begin", self.layer_number)
 
         # Step 1: Prepare single-head KV
-        kv = key.squeeze(2)  # [b, sq, v_head_dim]
+        with _nvtx_range("csa/prepare_kv"):
+            kv = key.squeeze(2)  # [b, sq, v_head_dim]
 
         # Step 2: Compression
-        if self.compressor is not None and self.compress_ratio > 1:
-            compressed_kv = self.compressor(x)  # [b, n_compressed, v_head_dim]
-            if compressed_kv is not None:
-                kv_full = paddle.concat([kv, compressed_kv], axis=1)
-                n_compressed = compressed_kv.shape[1]
-                _csa_log_memory("after_compressor_concat", self.layer_number)
+        with _nvtx_range("csa/compression"):
+            if self.compressor is not None and self.compress_ratio > 1:
+                compressed_kv = self.compressor(x)  # [b, n_compressed, v_head_dim]
+                if compressed_kv is not None:
+                    kv_full = paddle.concat([kv, compressed_kv], axis=1)
+                    n_compressed = compressed_kv.shape[1]
+                else:
+                    kv_full = kv
+                    n_compressed = 0
             else:
                 kv_full = kv
                 n_compressed = 0
-        else:
-            kv_full = kv
-            n_compressed = 0
 
         offset = sq  # compressed indices start after original positions
 
         # Step 3: Window indices
-        window_idxs = get_window_topk_idxs(self.window_size, b, sq)
+        with _nvtx_range("csa/window_indices"):
+            window_idxs = get_window_topk_idxs(self.window_size, b, sq)
 
-        # Step 4: Compressed indices
-        indexer_loss = None
-        tilelang_indexer_loss_state = None
-        topk_indices_compressed = None
+        # Step 4: Compressed indices and sparse attention
+        indexer_backend = getattr(self.config, 'csa_indexer_backend', 'tilelang')
+        sparse_fwd_backend = getattr(self.config, 'csa_sparse_fwd_backend', 'tilelang')
+        capture_indexer_sparse_attention = (
+            self.indexer is not None
+            and self.compress_ratio > 1
+            and n_compressed > 0
+        )
+        with _nsys_capture_range(
+            f"csa_indexer_sparse_attention_{indexer_backend}_{sparse_fwd_backend}",
+            enabled=capture_indexer_sparse_attention,
+        ):
+            indexer_loss = None
+            tilelang_indexer_loss_state = None
+            topk_indices_compressed = None
 
-        if self.compress_ratio > 1 and n_compressed > 0:
-            if self.indexer is not None:
-                (
-                    compress_topk_idxs,
-                    indexer_loss,
-                    tilelang_indexer_loss_state,
-                    topk_indices_compressed,
-                ) = self._compute_indexer_compressed_topk_idxs(
-                    query,
-                    x,
-                    qr,
-                    compressed_kv,
-                    n_compressed,
-                    offset,
+            if self.compress_ratio > 1 and n_compressed > 0:
+                if self.indexer is not None:
+                    with _nvtx_range(f"csa/compressed_indices[{indexer_backend}]"):
+                        (
+                            compress_topk_idxs,
+                            indexer_loss,
+                            tilelang_indexer_loss_state,
+                            topk_indices_compressed,
+                        ) = self._compute_indexer_compressed_topk_idxs(
+                            query,
+                            x,
+                            qr,
+                            compressed_kv,
+                            n_compressed,
+                            offset,
+                        )
+                else:
+                    # ratio=128: attend to all compressed positions
+                    compress_topk_idxs = get_compress_topk_idxs(
+                        self.compress_ratio,
+                        b,
+                        sq,
+                        offset,
+                    )
+
+                if compress_topk_idxs.dtype != window_idxs.dtype:
+                    compress_topk_idxs = compress_topk_idxs.cast(window_idxs.dtype)
+                topk_idxs = paddle.concat(
+                    [window_idxs, compress_topk_idxs], axis=-1
                 )
             else:
-                # ratio=128: attend to all compressed positions
-                compress_topk_idxs = get_compress_topk_idxs(
-                    self.compress_ratio,
-                    b,
-                    sq,
-                    offset,
+                topk_idxs = window_idxs
+
+            topk_idxs = topk_idxs.cast("int32")
+
+            # use_cudnn_target was for the old FusedDSAIndexerLoss path that needed
+            # FlashMLA to output lse_indexer. The new cuDNN loss path computes target
+            # independently via csa_attn_target_reducesum, so this is no longer needed.
+            use_cudnn_target = False
+            indexer_topk_for_fwd = 0
+
+            # Step 5: Sparse attention
+            with _nvtx_range(f"csa/sparse_attention[{sparse_fwd_backend}]"):
+                output, lse_indexer = self.compressed_sparse_attn(
+                    query,
+                    kv_full,
+                    self.attn_sink,
+                    topk_idxs,
+                    self.softmax_scale,
+                    indexer_topk=indexer_topk_for_fwd,
                 )
-
-            if compress_topk_idxs.dtype != window_idxs.dtype:
-                compress_topk_idxs = compress_topk_idxs.cast(window_idxs.dtype)
-            topk_idxs = paddle.concat(
-                [window_idxs, compress_topk_idxs], axis=-1
-            )
-        else:
-            topk_idxs = window_idxs
-
-        topk_idxs = topk_idxs.cast("int32")
-
-        # use_cudnn_target was for the old FusedDSAIndexerLoss path that needed
-        # FlashMLA to output lse_indexer. The new cuDNN loss path computes target
-        # independently via csa_attn_target_reducesum, so this is no longer needed.
-        use_cudnn_target = False
-        indexer_topk_for_fwd = 0
-
-        # Step 5: Sparse attention
-        _csa_log_memory(f"before_sparse_attn_fwd[{getattr(self.config, 'csa_sparse_fwd_backend', 'tilelang')}]", self.layer_number)
-        output, lse_indexer = self.compressed_sparse_attn(
-            query,
-            kv_full,
-            self.attn_sink,
-            topk_idxs,
-            self.softmax_scale,
-            indexer_topk=indexer_topk_for_fwd,
-        )
-        _csa_log_memory(f"after_sparse_attn_fwd[{getattr(self.config, 'csa_sparse_fwd_backend', 'tilelang')}]", self.layer_number)
 
         # Step 5b: For cuDNN path, indexer_loss was already computed by
         # FusedDSAIndexerLoss (line 1318 branch) using Paddle topk — reuse it.
@@ -1608,16 +1611,14 @@ class CompressedSparseAttention(FleetLayer):
 
         # Step 6: Attach indexer loss to backward graph
         if tilelang_indexer_loss_state is not None and self.training:
-            _csa_log_memory("before_indexer_loss_attach", self.layer_number)
-            output = TileLangCSAIndexerLossAutoScaler.apply(
-                output,
-                *tilelang_indexer_loss_state,
-            )
-            _csa_log_memory("after_indexer_loss_attach", self.layer_number)
+            with _nvtx_range(f"csa/indexer_loss_attach[{tilelang_indexer_loss_state[-1]}]"):
+                output = TileLangCSAIndexerLossAutoScaler.apply(
+                    output,
+                    *tilelang_indexer_loss_state,
+                )
         elif indexer_loss is not None and self.training:
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
-        _csa_log_memory("csa_forward_end", self.layer_number)
         return output
 
     def compressed_sparse_attn(
