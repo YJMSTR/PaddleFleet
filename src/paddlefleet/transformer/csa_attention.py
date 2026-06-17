@@ -715,7 +715,11 @@ def _compute_fused_csa_indexer_loss_forward(
             index_q, index_k_comp, weights, ratio=int(ratio)
         )
         topk_indices, _ = cudnn_indexer_topk(
-            scores, int(index_q.shape[1]), int(ratio), int(topk_effective)
+            scores,
+            int(index_q.shape[1]),
+            int(ratio),
+            int(topk_effective),
+            valid_range=valid_range,
         )
         # Gather scores at topk positions and softmax to get probs
         # topk_indices: [B, Sq, topk], scores: [B, Sq, Sk]
@@ -1659,6 +1663,8 @@ class CompressedSparseAttention(FleetLayer):
                         weights_indexer_cu,
                         ratio=self.compress_ratio,
                         topk_effective=attn_topk_effective,
+                        valid_range=valid_range,
+                        startend_row_indices=startend_row_indices,
                     )
                 topk_indices_compressed = cu_topk_indices
 

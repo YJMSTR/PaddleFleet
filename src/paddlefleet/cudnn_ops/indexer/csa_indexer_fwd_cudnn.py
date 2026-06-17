@@ -111,7 +111,7 @@ def cudnn_indexer_forward(
     return result["scores"]
 
 
-def cudnn_indexer_topk(scores, sq, ratio, topk):
+def cudnn_indexer_topk(scores, sq, ratio, topk, valid_range=None):
     """Select top-K indices using cuDNN TRT-LLM radix kernel (SM100).
 
     Args:
@@ -119,9 +119,14 @@ def cudnn_indexer_topk(scores, sq, ratio, topk):
         sq:      query sequence length.
         ratio:   compression ratio.
         topk:    number of entries to select per query position.
+        valid_range: optional [B, S_q, 2] int32 per-query left-closed
+            compressed-KV range ``[valid_start, valid_end)`` for document-mask
+            (packed multi-document) training. ``None`` => causal-only mode
+            (legacy single-document behavior, byte-for-byte unchanged).
 
     Returns:
-        topk_indices: [B, S_q, topk] int32, invalid slots are -1.
+        topk_indices: [B, S_q, topk] int32 **global** compressed-buffer ids,
+            invalid slots are -1.
         topk_length:  [B, S_q] int32, per-row valid count.
     """
     batch = int(scores.shape[0])
@@ -130,21 +135,53 @@ def cudnn_indexer_topk(scores, sq, ratio, topk):
     topk = int(topk)
     topk_k = min(topk, sk)
 
-    q_idx = paddle.arange(sq, dtype="int32")
-    seq_lens = paddle.clip((q_idx + 1) // int(ratio), max=sk).tile([batch])
     _require_cudnn_frontend()
     from paddlefleet_ops.cudnn.deepseek_sparse_attention.indexer_top_k.api import (
         indexer_top_k_wrapper,
     )
 
+    if valid_range is None:
+        # Causal-only (single-document): the radix kernel's per-row prefix
+        # length is exactly the ratio-causal limit. No id remap needed —
+        # local == global because there is a single compressed buffer.
+        q_idx = paddle.arange(sq, dtype="int32")
+        seq_lens = paddle.clip((q_idx + 1) // int(ratio), max=sk).tile([batch])
+        scores_for_topk = scores
+        valid_range_for_remap = None
+    else:
+        # Document-mask: the valid window [valid_start, valid_end) is an
+        # arbitrary sub-interval, but the radix kernel only honors prefixes
+        # [0, seq_lens). Left-align each query's window to [0, count), run
+        # top-k in that local space, then map the selected local ids back to
+        # global compressed-buffer ids by adding valid_start.
+        from .docmask_utils import (
+            shift_scores_to_local_window,
+            topk_local_to_global,
+        )
+
+        if valid_range.shape[0] != batch or valid_range.shape[1] != sq:
+            raise ValueError(
+                f"valid_range must have shape [{batch}, {sq}, 2], got "
+                f"{list(valid_range.shape)}"
+            )
+        scores_for_topk, counts = shift_scores_to_local_window(
+            scores, valid_range
+        )
+        seq_lens = counts.reshape([batch * sq]).cast("int32")
+        valid_range_for_remap = valid_range
+
     result = indexer_top_k_wrapper(
-        scores.reshape([batch * sq, sk]).contiguous(),
+        scores_for_topk.reshape([batch * sq, sk]).contiguous(),
         seq_lens,
         top_k=topk_k,
         next_n=1,
         return_val=False,
     )
     topk_indices = result["indices"].reshape([batch, sq, topk_k]).cast("int32")
+
+    if valid_range_for_remap is not None:
+        # local (per-document, [0, count)) -> global; -1 slots preserved.
+        topk_indices = topk_local_to_global(topk_indices, valid_range_for_remap)
 
     if topk_k < topk:
         padding = paddle.full([batch, sq, topk - topk_k], -1, dtype="int32")
@@ -161,6 +198,7 @@ def cudnn_indexer_topk_fwd(
     ratio=4,
     topk_effective=64,
     indexer_softmax_scale=1.0,
+    valid_range=None,
 ):
     """Run cuDNN-frontend DSA indexer forward on Paddle tensors.
 
@@ -171,9 +209,13 @@ def cudnn_indexer_topk_fwd(
         ratio:                  compression ratio (e.g. 4).
         topk_effective:         number of entries to select per query position.
         indexer_softmax_scale:  additional scale on weights.
+        valid_range:            optional [B, S, 2] int32 per-query left-closed
+            compressed-KV range for document-mask (packed multi-document)
+            training. ``None`` => causal-only single-document mode (unchanged).
 
     Returns:
-        topk_indices: [B, S, topk_effective] int32, invalid slots are -1.
+        topk_indices: [B, S, topk_effective] int32 global compressed-buffer ids,
+            invalid slots are -1.
         topk_length:  [B, S] int32, per-row valid count.
     """
     _validate_indexer_inputs(index_q, index_k_comp, weights)
@@ -195,4 +237,5 @@ def cudnn_indexer_topk_fwd(
         int(index_q.shape[1]),
         ratio,
         topk_effective,
+        valid_range=valid_range,
     )
