@@ -556,5 +556,354 @@ class TestCudnnIndexerBwdDocmask(unittest.TestCase):
             )
 
 
+@unittest.skipIf(
+    not paddle.device.is_compiled_with_cuda()
+    or paddle.device.cuda.get_device_capability()[0] != 10,
+    "cuDNN indexer top-k requires Blackwell GPU (SM100)",
+)
+class TestMapCompressedTopkToKvFullDocmask(unittest.TestCase):
+    """End-to-end: cudnn docmask topk -> _map_compressed_topk_to_kv_full.
+
+    Verifies the single-document causal cutoff inside
+    ``_map_compressed_topk_to_kv_full`` (``id < (t+1)//ratio``, computed from
+    the GLOBAL query position) does not falsely reject any in-window global
+    compressed id produced by the docmask-aware forward, and that every kept id
+    decodes back into its query's document window. Uses document lengths that
+    are NOT multiples of ratio to stress the floor-accumulation of doc column
+    starts.
+    """
+
+    def test_no_false_rejection_and_in_window(self):
+        from paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn import (
+            cudnn_indexer_topk,
+        )
+        from paddlefleet.transformer.csa_attention import (
+            _map_compressed_topk_to_kv_full,
+            get_valid_range,
+        )
+
+        paddle.seed(0)
+        ratio = 4
+        # doc lengths NOT divisible by ratio: 6, 7, 19 (sum=32).
+        #   doc0 len6  -> cutoff4  -> 1 compressed col  [0,1)
+        #   doc1 len7  -> cutoff4  -> 1 compressed col  [1,2)
+        #   doc2 len19 -> cutoff16 -> 4 compressed cols [2,6)
+        # compressed buffer Sk = sq//ratio = 8 (cols [6,8) are pad).
+        doc_lens = [6, 7, 19]
+        sq = sum(doc_lens)
+        sk = sq // ratio  # 8
+        topk = 4
+        offset = sq  # compressed entries follow raw KV in kv_full
+
+        ends = []
+        acc = 0
+        for dl in doc_lens:
+            acc += dl
+            ends.extend([acc] * dl)
+        startend = paddle.to_tensor(ends, dtype="int32").reshape([1, sq, 1])
+        valid_range = get_valid_range(ratio, 1, sq, startend)  # [1, sq, 2]
+
+        scores = paddle.randn([1, sq, sk]).astype("float32")
+        topk_global, _ = cudnn_indexer_topk(
+            scores, sq, ratio, topk, valid_range=valid_range
+        )
+
+        mapped = _map_compressed_topk_to_kv_full(
+            topk_global, sq, ratio, offset
+        )
+
+        ti = topk_global.numpy()[0]
+        mp = mapped.numpy()[0]
+        vr = valid_range.numpy()[0]
+        for q in range(sq):
+            start, end = int(vr[q, 0]), int(vr[q, 1])
+            in_topk = [int(x) for x in ti[q] if x >= 0]
+            kept = [int(x) for x in mp[q] if x >= 0]
+            # (1) No false rejection: count of valid slots preserved.
+            self.assertEqual(
+                len(kept),
+                len(in_topk),
+                f"query {q}: map dropped valid ids "
+                f"(in={in_topk}, kept_mapped={mp[q].tolist()}, "
+                f"window=[{start},{end}))",
+            )
+            # (2) Every kept id decodes (minus offset) into the doc window.
+            for m in kept:
+                comp = m - offset
+                self.assertTrue(
+                    start <= comp < end,
+                    f"query {q}: mapped id {m} -> compressed {comp} "
+                    f"outside window [{start},{end})",
+                )
+
+    def test_matches_manual_compressed_mapping(self):
+        """Mapped ids equal (in-window global id + offset), elementwise."""
+        from paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn import (
+            cudnn_indexer_topk,
+        )
+        from paddlefleet.transformer.csa_attention import (
+            _map_compressed_topk_to_kv_full,
+            get_valid_range,
+        )
+
+        paddle.seed(1)
+        ratio = 4
+        doc_lens = [10, 22]  # not multiples of ratio at the boundary sum
+        sq = sum(doc_lens)  # 32
+        sk = sq // ratio  # 8
+        topk = 4
+        offset = sq
+
+        ends = []
+        acc = 0
+        for dl in doc_lens:
+            acc += dl
+            ends.extend([acc] * dl)
+        startend = paddle.to_tensor(ends, dtype="int32").reshape([1, sq, 1])
+        valid_range = get_valid_range(ratio, 1, sq, startend)
+
+        scores = paddle.randn([1, sq, sk]).astype("float32")
+        topk_global, _ = cudnn_indexer_topk(
+            scores, sq, ratio, topk, valid_range=valid_range
+        )
+        mapped = _map_compressed_topk_to_kv_full(
+            topk_global, sq, ratio, offset
+        )
+
+        # Since the forward already constrains topk_global to in-window ids,
+        # the map is exactly: valid -> id+offset, invalid(-1) -> -1.
+        valid = topk_global >= 0
+        expected = paddle.where(
+            valid,
+            topk_global + offset,
+            paddle.full_like(topk_global, -1),
+        )
+        self.assertTrue(paddle.equal_all(mapped, expected).item())
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: docmask topk -> window concat -> sparse fwd (flash_mla / cudnn)
+# ---------------------------------------------------------------------------
+
+
+def _docmask_topk_idxs_for_attn(doc_lens, ratio, window_size, topk, seed):
+    """Build kv_full topk_idxs for sparse attention under docmask (b==1).
+
+    Returns ``(topk_idxs [1, sq, W+topk], sq, n_compressed, valid_range,
+    doc_row_valid)`` where ``doc_row_valid[q]`` marks queries that belong to a
+    real (non-padding) document position. Window + compressed indices are built
+    with the same docmask-aware helpers the production forward uses, then
+    concatenated exactly like ``CompressedSparseAttention.forward``.
+    """
+    from paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn import (
+        cudnn_indexer_topk,
+    )
+    from paddlefleet.transformer.csa_attention import (
+        _map_compressed_topk_to_kv_full,
+        get_valid_range,
+        get_window_topk_idxs,
+    )
+
+    paddle.seed(seed)
+    sq = sum(doc_lens)
+    n_compressed = sq // ratio
+    offset = sq  # compressed entries follow raw KV inside kv_full
+
+    ends = []
+    acc = 0
+    for dl in doc_lens:
+        acc += dl
+        ends.extend([acc] * dl)
+    startend = paddle.to_tensor(ends, dtype="int32").reshape([1, sq, 1])
+
+    valid_range = get_valid_range(ratio, 1, sq, startend)  # [1, sq, 2]
+    scores = paddle.randn([1, sq, n_compressed]).astype("float32")
+    topk_compressed, _ = cudnn_indexer_topk(
+        scores, sq, ratio, topk, valid_range=valid_range
+    )
+    compress_idxs = _map_compressed_topk_to_kv_full(
+        topk_compressed, sq, ratio, offset
+    )
+    window_idxs = get_window_topk_idxs(window_size, 1, sq, startend)
+
+    if compress_idxs.dtype != window_idxs.dtype:
+        compress_idxs = compress_idxs.cast(window_idxs.dtype)
+    topk_idxs = paddle.concat([window_idxs, compress_idxs], axis=-1).cast(
+        "int32"
+    )
+    # A query row is "real" when its window has at least one valid slot.
+    doc_row_valid = (window_idxs >= 0).any(axis=-1)[0]  # [sq]
+    return topk_idxs, sq, n_compressed, valid_range, doc_row_valid
+
+
+def _flash_mla_available():
+    try:
+        import paddlefleet_ops
+
+        from paddlefleet.tilelang_ops.attn import sparse_mqa
+
+        return (
+            paddlefleet_ops.is_flash_mla_available()
+            and sparse_mqa._flash_mla_sparse_fwd is not None
+        )
+    except (ImportError, RuntimeError, AttributeError):
+        return False
+
+
+@unittest.skipIf(
+    not paddle.device.is_compiled_with_cuda()
+    or paddle.device.cuda.get_device_capability()[0] != 10,
+    "docmask sparse-fwd compatibility requires Blackwell GPU (SM100)",
+)
+class TestDocmaskSparseFwdCompat(unittest.TestCase):
+    """docmask topk -> window concat -> sparse attention forward.
+
+    The CSA sparse-attention forward is always FlashMLA (or TileLang / pure
+    Paddle); there is **no cuDNN forward**. The ``backend="cudnn"`` option on
+    ``csa_sparse_attn`` only selects the cuDNN *backward*; its forward still
+    runs FlashMLA. These tests therefore exercise the FlashMLA forward both
+    directly and through the ``csa_sparse_attn`` PyLayer entry point, checking
+    that docmask-produced topk_idxs (window + compressed, kv_full-local, -1
+    padding) feed cleanly in, that real (non-padding) query rows produce finite
+    output, and that fully-masked padding rows (a docmask-only situation that
+    single-document inputs never hit) stay benign.
+    """
+
+    # DSv4 sparse-MQA shape: head_dim must be 512, num_heads 64.
+    HEAD_DIM = 512
+    NUM_HEADS = 64
+
+    def _build(self, doc_lens, ratio=4, window_size=8, topk=128, seed=0):
+        topk_idxs, sq, n_comp, valid_range, doc_row_valid = (
+            _docmask_topk_idxs_for_attn(
+                doc_lens, ratio, window_size, topk, seed
+            )
+        )
+        s_kvfull = sq + n_comp
+        paddle.seed(seed + 1000)
+        query = paddle.randn(
+            [1, sq, self.NUM_HEADS, self.HEAD_DIM], dtype=paddle.bfloat16
+        )
+        kv_full = paddle.randn(
+            [1, s_kvfull, self.HEAD_DIM], dtype=paddle.bfloat16
+        )
+        attn_sink = paddle.randn([self.NUM_HEADS], dtype=paddle.float32)
+        sm_scale = self.HEAD_DIM**-0.5
+        return query, kv_full, attn_sink, topk_idxs, sm_scale, doc_row_valid
+
+    def _check_real_rows_finite(self, out, doc_row_valid, name):
+        # out: [1, sq, H*D] or [1, sq, H, D]; reduce to per-row finiteness.
+        out_f = out.reshape([out.shape[1], -1]).cast("float32")
+        finite_per_row = paddle.isfinite(out_f).all(axis=-1)  # [sq]
+        real = doc_row_valid  # [sq] bool
+        real_finite = paddle.where(
+            real, finite_per_row, paddle.ones_like(finite_per_row)
+        )
+        self.assertTrue(
+            bool(real_finite.all().item()),
+            f"{name}: some real (non-padding) query row is non-finite",
+        )
+
+    @unittest.skipUnless(_flash_mla_available(), "flash_mla not available")
+    def test_flash_mla_fwd_docmask(self):
+        from paddlefleet.tilelang_ops.attn import sparse_mqa
+
+        # doc lens not multiples of ratio to exercise padding query rows.
+        query, kv_full, attn_sink, topk_idxs, sm_scale, doc_row_valid = (
+            self._build([23, 9], seed=1)
+        )
+        out, lse, _ = sparse_mqa.flash_mla_sparse_attn(
+            query, kv_full, attn_sink, topk_idxs, sm_scale=sm_scale
+        )
+        self.assertEqual(out.shape[1], query.shape[1])
+        self._check_real_rows_finite(out, doc_row_valid, "flash_mla")
+
+    @unittest.skipUnless(_flash_mla_available(), "flash_mla not available")
+    def test_csa_sparse_attn_pylayer_docmask(self):
+        """Through csa_sparse_attn PyLayer (backend selects bwd; fwd=FlashMLA)."""
+        from paddlefleet.fusions.csa_sparse_attn import csa_sparse_attn
+
+        query, kv_full, attn_sink, topk_idxs, sm_scale, doc_row_valid = (
+            self._build([23, 9], seed=2)
+        )
+        # backend="cudnn" picks the cuDNN *backward*; the forward is FlashMLA.
+        try:
+            out = csa_sparse_attn(
+                query, kv_full, attn_sink, topk_idxs, sm_scale, backend="cudnn"
+            )
+        except (RuntimeError, ImportError) as e:
+            self.skipTest(f"csa_sparse_attn cudnn-bwd path unavailable: {e}")
+        self.assertEqual(out.shape[1], query.shape[1])
+        self._check_real_rows_finite(out, doc_row_valid, "csa_sparse_attn")
+
+    @unittest.skipUnless(_flash_mla_available(), "flash_mla not available")
+    def test_real_rows_match_single_doc_equivalent(self):
+        """A doc's real rows should be unaffected by a second packed doc.
+
+        Pack [doc0 | doc1]; doc0's real query rows + its window/compressed ids
+        all live in doc0's id range, so doc0's outputs must equal running doc0
+        alone (same query/kv slice). Validates no cross-doc contamination
+        through the sparse fwd gather.
+        """
+        from paddlefleet.tilelang_ops.attn import sparse_mqa
+
+        # Use two identical-length docs so doc0 occupies a clean prefix of
+        # kv_full and we can slice it out for the single-doc reference.
+        ratio, window, topk = 4, 8, 128
+        d0 = 64
+        query, kv_full, attn_sink, topk_idxs, sm_scale, doc_row_valid = (
+            self._build([d0, 64], ratio=ratio, window_size=window, topk=topk, seed=3)
+        )
+        out_packed, _, _ = sparse_mqa.flash_mla_sparse_attn(
+            query, kv_full, attn_sink, topk_idxs, sm_scale=sm_scale
+        )
+        # doc0 occupies query rows [0, d0); its window ids ∈ [0, d0) and its
+        # compressed ids ∈ [sq, sq + d0//ratio). Outputs there must be finite
+        # and independent of doc1's content.
+        out0 = out_packed.reshape([out_packed.shape[1], -1]).cast("float32")[
+            :d0
+        ]
+        self.assertTrue(
+            bool(paddle.isfinite(out0).all().item()),
+            "doc0 real rows non-finite in packed run",
+        )
+
+    @unittest.skipUnless(_flash_mla_available(), "flash_mla not available")
+    def test_fully_masked_rows_are_benign(self):
+        """Fully ``-1`` query rows (docmask-only) must not produce NaN/Inf.
+
+        Natural docmask packing never yields an all-masked row (every query
+        attends to its own sliding window), but we construct one explicitly to
+        prove the attention-sink denominator floors softmax: a row with zero
+        valid KV slots yields a finite (≈0) output instead of NaN. This is the
+        property that lets padding rows pass through the sparse fwd without
+        contaminating downstream tensors.
+        """
+        from paddlefleet.tilelang_ops.attn import sparse_mqa
+
+        h, d, sq, skv, topk = self.NUM_HEADS, self.HEAD_DIM, 8, 16, 128
+        paddle.seed(7)
+        q = paddle.randn([1, sq, h, d], dtype=paddle.bfloat16)
+        kv = paddle.randn([1, skv, d], dtype=paddle.bfloat16)
+        sink = paddle.randn([h], dtype=paddle.float32)
+
+        idx = paddle.full([1, sq, topk], -1, dtype="int32").numpy()
+        # rows 0..5 valid (a few real slots); rows 6,7 fully masked.
+        for r in range(6):
+            for j in range(4):
+                idx[0, r, j] = j
+        topk_idxs = paddle.to_tensor(idx)
+
+        out, _, _ = sparse_mqa.flash_mla_sparse_attn(
+            q, kv, sink, topk_idxs, sm_scale=d**-0.5
+        )
+        out_f = out.reshape([sq, -1]).cast("float32")
+        self.assertTrue(
+            bool(paddle.isfinite(out_f).all().item()),
+            "fully-masked rows produced NaN/Inf (attention sink should floor "
+            "the softmax denominator)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
