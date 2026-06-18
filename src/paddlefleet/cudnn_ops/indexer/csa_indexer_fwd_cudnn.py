@@ -32,6 +32,32 @@ def _require_cudnn_frontend():
         raise ImportError(CUDNN_FRONTEND_HINT)
 
 
+def _check_cudnn_indexer_shape_support(index_q, index_k_comp, ratio):
+    """Guard host-side shape contracts the cuDNN indexer forward cannot honor.
+
+    The cuDNN CSA indexer forward kernel does not reliably support short
+    compressed-KV shapes: ``S_k == 1`` crashes inside the CUDA kernel with
+    ``cudaErrorIllegalInstruction`` (715) rather than failing cleanly, and the
+    underlying ratio-causal kernel requires ``S_q <= S_k * ratio``. Both checks
+    are cheap host-side asserts; converting them into a readable ValueError
+    keeps an unsupported short-sequence case from becoming an opaque CUDA crash
+    deep in training/eval. TileLang / pure-Paddle remain the recommended
+    backends for standalone short sequences.
+    """
+    sk = int(index_k_comp.shape[1])
+    sq = int(index_q.shape[1])
+    if sk < 2:
+        raise ValueError(
+            "cuDNN CSA indexer currently requires compressed KV length >= 2; "
+            f"got S_k={sk}. Use the TileLang/Paddle indexer for short sequences."
+        )
+    if sq > sk * int(ratio):
+        raise ValueError(
+            "cuDNN CSA indexer requires S_q <= S_k * ratio; "
+            f"got S_q={sq}, S_k={sk}, ratio={int(ratio)}."
+        )
+
+
 def _validate_indexer_inputs(index_q, index_k_comp, weights):
     if not isinstance(index_q, paddle.Tensor):
         raise TypeError(
@@ -94,6 +120,7 @@ def cudnn_indexer_forward(
     Returns:
         scores: [B, S_q, S_k] fp32 Paddle tensor. Masked positions are -inf.
     """
+    _check_cudnn_indexer_shape_support(index_q, index_k_comp, ratio)
     if sm_scale is None:
         sm_scale = float(index_q.shape[-1]) ** -0.5
     _require_cudnn_frontend()
