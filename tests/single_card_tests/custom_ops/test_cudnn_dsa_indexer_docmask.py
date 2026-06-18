@@ -347,6 +347,7 @@ class TestCudnnIndexerTopkDocmask(unittest.TestCase):
             scores, sq, ratio, topk, valid_range=valid_range
         )
         ti = topk_indices.numpy()[0]
+        tl = topk_length.numpy()[0]
         vr = valid_range.numpy()[0]
         for q in range(sq):
             start, end = int(vr[q, 0]), int(vr[q, 1])
@@ -356,9 +357,19 @@ class TestCudnnIndexerTopkDocmask(unittest.TestCase):
                     start <= x < end,
                     f"query {q}: id {x} outside window [{start},{end})",
                 )
+            # topk_length must equal the number of valid picks; empty-range
+            # queries must report length 0 (locks the -1/length contract).
+            self.assertEqual(
+                int(tl[q]),
+                len(picks),
+                f"query {q}: topk_length {int(tl[q])} != valid picks {len(picks)}",
+            )
             if end == start:
                 self.assertEqual(
                     picks, [], f"empty-range query {q} picked {picks}"
+                )
+                self.assertEqual(
+                    int(tl[q]), 0, f"empty-range query {q} length != 0"
                 )
 
     def test_docmask_matches_per_doc_reference(self):
@@ -608,9 +619,7 @@ class TestMapCompressedTopkToKvFullDocmask(unittest.TestCase):
             scores, sq, ratio, topk, valid_range=valid_range
         )
 
-        mapped = _map_compressed_topk_to_kv_full(
-            topk_global, sq, ratio, offset
-        )
+        mapped = _map_compressed_topk_to_kv_full(topk_global, sq, ratio, offset)
 
         ti = topk_global.numpy()[0]
         mp = mapped.numpy()[0]
@@ -666,9 +675,7 @@ class TestMapCompressedTopkToKvFullDocmask(unittest.TestCase):
         topk_global, _ = cudnn_indexer_topk(
             scores, sq, ratio, topk, valid_range=valid_range
         )
-        mapped = _map_compressed_topk_to_kv_full(
-            topk_global, sq, ratio, offset
-        )
+        mapped = _map_compressed_topk_to_kv_full(topk_global, sq, ratio, offset)
 
         # Since the forward already constrains topk_global to in-window ids,
         # the map is exactly: valid -> id+offset, invalid(-1) -> -1.
@@ -838,34 +845,70 @@ class TestDocmaskSparseFwdCompat(unittest.TestCase):
 
     @unittest.skipUnless(_flash_mla_available(), "flash_mla not available")
     def test_real_rows_match_single_doc_equivalent(self):
-        """A doc's real rows should be unaffected by a second packed doc.
+        """doc0's packed rows == doc0 run alone (no cross-doc contamination).
 
-        Pack [doc0 | doc1]; doc0's real query rows + its window/compressed ids
-        all live in doc0's id range, so doc0's outputs must equal running doc0
-        alone (same query/kv slice). Validates no cross-doc contamination
-        through the sparse fwd gather.
+        Build a packed [doc0 | doc1] topk via the docmask helpers, then build
+        doc0 alone (same doc0 length, its own startend). doc0's query rows,
+        window ids and compressed ids all live in doc0's id range, so slicing
+        doc0 out of the packed run must equal the standalone doc0 run when fed
+        the SAME query / kv_full slice. Any leak of doc1 KV into doc0 rows would
+        break the equality. Uses doc lengths that are multiples of ratio so
+        doc0 occupies a clean prefix [0, d0) of raw KV and [sq, sq+d0//ratio)
+        of compressed KV, making the standalone slice exact.
         """
         from paddlefleet.tilelang_ops.attn import sparse_mqa
 
-        # Use two identical-length docs so doc0 occupies a clean prefix of
-        # kv_full and we can slice it out for the single-doc reference.
         ratio, window, topk = 4, 8, 128
-        d0 = 64
-        query, kv_full, attn_sink, topk_idxs, sm_scale, doc_row_valid = (
-            self._build([d0, 64], ratio=ratio, window_size=window, topk=topk, seed=3)
+        d0, d1 = 64, 64
+        sq = d0 + d1
+        n0 = d0 // ratio  # doc0 compressed cols
+        topk_idxs, _sq, n_comp, _vr, _drv = _docmask_topk_idxs_for_attn(
+            [d0, d1], ratio, window, topk, seed=3
         )
+        self.assertEqual(_sq, sq)
+        s_kvfull = sq + n_comp
+
+        paddle.seed(1234)
+        query = paddle.randn(
+            [1, sq, self.NUM_HEADS, self.HEAD_DIM], dtype=paddle.bfloat16
+        )
+        kv_full = paddle.randn(
+            [1, s_kvfull, self.HEAD_DIM], dtype=paddle.bfloat16
+        )
+        attn_sink = paddle.randn([self.NUM_HEADS], dtype=paddle.float32)
+        sm_scale = self.HEAD_DIM**-0.5
+
         out_packed, _, _ = sparse_mqa.flash_mla_sparse_attn(
             query, kv_full, attn_sink, topk_idxs, sm_scale=sm_scale
         )
-        # doc0 occupies query rows [0, d0); its window ids ∈ [0, d0) and its
-        # compressed ids ∈ [sq, sq + d0//ratio). Outputs there must be finite
-        # and independent of doc1's content.
-        out0 = out_packed.reshape([out_packed.shape[1], -1]).cast("float32")[
-            :d0
-        ]
+
+        # Standalone doc0: query rows [0, d0); its kv_full is doc0's raw KV
+        # [0, d0) followed by doc0's compressed cols [sq, sq+n0). Remap doc0's
+        # packed topk ids into this compact [0, d0+n0) buffer.
+        q0 = query[:, :d0].contiguous()
+        kv0 = paddle.concat(
+            [kv_full[:, :d0], kv_full[:, sq : sq + n0]], axis=1
+        ).contiguous()
+        idx0 = topk_idxs[:, :d0].clone().numpy()
+        # raw-KV ids [0,d0) stay; compressed ids [sq, sq+n0) -> [d0, d0+n0); -1 stays.
+        remap = idx0.copy()
+        comp_mask = idx0 >= sq
+        remap[comp_mask] = idx0[comp_mask] - sq + d0
+        idx0_remapped = paddle.to_tensor(remap, dtype="int32")
+
+        out_doc0, _, _ = sparse_mqa.flash_mla_sparse_attn(
+            q0, kv0, attn_sink, idx0_remapped, sm_scale=sm_scale
+        )
+
+        packed_doc0 = out_packed[:, :d0].reshape([d0, -1]).cast("float32")
+        alone_doc0 = out_doc0.reshape([d0, -1]).cast("float32")
+        # bf16 gather + fp32 accumulate: identical inputs -> identical output.
         self.assertTrue(
-            bool(paddle.isfinite(out0).all().item()),
-            "doc0 real rows non-finite in packed run",
+            paddle.allclose(
+                packed_doc0, alone_doc0, rtol=1e-2, atol=1e-2
+            ).item(),
+            "doc0 packed output diverges from standalone doc0 "
+            "(cross-document contamination through sparse fwd gather)",
         )
 
     @unittest.skipUnless(_flash_mla_available(), "flash_mla not available")
@@ -903,6 +946,227 @@ class TestDocmaskSparseFwdCompat(unittest.TestCase):
             "fully-masked rows produced NaN/Inf (attention sink should floor "
             "the softmax denominator)",
         )
+
+
+def _tilelang_indexer_bwd_available():
+    try:
+        from paddlefleet.tilelang_ops import csa_indexer_bwd  # noqa: F401
+
+        return True
+    except (ImportError, RuntimeError, AttributeError):
+        return False
+
+
+def _cos_rms(actual, ref):
+    a = actual.cast("float32").flatten()
+    r = ref.cast("float32").flatten()
+    na, nr = a.norm(), r.norm()
+    denom = (na * nr).item()
+    cos = 1.0 if denom == 0.0 else (a @ r / (na * nr)).item()
+    rms_err = (a - r).pow(2).mean().sqrt().item()
+    rms_ref = r.pow(2).mean().sqrt().item()
+    return cos, rms_err / max(rms_ref, 1e-12)
+
+
+def _ref_indexer_bwd_autograd(
+    index_q,
+    weights,
+    index_k,
+    topk_indices,
+    target,
+    topk_probs,
+    loss_coeff,
+    grad_loss,
+    ratio,
+):
+    """Pure-paddle autograd reference matching the cuDNN backward semantics.
+
+    Forward: scores = relu(q@k^T * sm_scale) weighted-summed over heads, gather
+    at topk_indices, masked. Loss = sum( ((topk_probs - target) * scale *
+    grad_loss).detach() * topk_score ), i.e. the linear KL-logit grad the cuDNN
+    kernel reduces to when the clipped-log path is not triggered (the same
+    reference used by test_cudnn_dsa_indexer_bwd.test_parity_against_reference).
+    """
+    import paddle.nn.functional as F
+
+    b, sq, h, d = index_q.shape
+    sk = index_k.shape[1]
+    topk = topk_indices.shape[-1]
+    sm = d**-0.5
+
+    q = index_q.cast("float32").detach()
+    q.stop_gradient = False
+    k = index_k.cast("float32").detach()
+    k.stop_gradient = False
+    w = weights.cast("float32").detach()
+    w.stop_gradient = False
+
+    scores = paddle.einsum("bshd,btd->bsht", q, k) * sm
+    scores = F.relu(scores)
+    scores = (scores * w.unsqueeze(-1)).sum(axis=2)  # [b, sq, sk]
+
+    idx = topk_indices.cast("int64")
+    valid = topk_indices >= 0
+    safe = paddle.where(valid, idx, paddle.zeros_like(idx))
+    topk_score = paddle.take_along_axis(scores, safe, axis=-1)
+    topk_score = paddle.where(valid, topk_score, paddle.zeros_like(topk_score))
+
+    scale = loss_coeff / float(b * sq)
+    og = (topk_probs - target) * scale
+    if grad_loss is not None:
+        og = og * grad_loss
+    loss = (og.detach() * topk_score).sum()
+    loss.backward()
+    return q.grad, w.grad, k.grad
+
+
+@unittest.skipIf(
+    not paddle.device.is_compiled_with_cuda()
+    or paddle.device.cuda.get_device_capability()[0] != 10,
+    "cuDNN indexer backward requires Blackwell GPU (SM100)",
+)
+class TestCudnnVsTilelangIndexerBwdDocmask(unittest.TestCase):
+    """P2-3: cuDNN docmask backward gradient correctness on packed multi-doc.
+
+    cuDNN and TileLang indexer backwards take **different OGrad contracts**:
+    TileLang consumes an externally computed ``grad_scores`` (grad w.r.t. topk
+    logits) and only back-props logit->(q,k,w); cuDNN consumes (target,
+    topk_probs, loss_coeff) and computes the clipped-log KL grad_signal
+    internally. They are therefore not directly comparable by feeding identical
+    tensors. Instead we validate both against a shared pure-paddle autograd
+    reference (the same reference test_cudnn_dsa_indexer_bwd uses), under a
+    realistic packed multi-document docmask input produced by
+    get_valid_range(startend) + the cuDNN docmask forward top-k.
+
+    This locks: (a) cuDNN docmask backward matches the autograd ground truth;
+    (b) TileLang docmask backward matches the same ground truth; hence the two
+    backends are mutually consistent on packed multi-doc gradients.
+    """
+
+    def setUp(self):
+        from paddlefleet.cudnn_ops import csa_indexer_bwd as cudnn_bwd
+
+        self.cudnn_bwd = cudnn_bwd
+        self.has_tl = _tilelang_indexer_bwd_available()
+        if self.has_tl:
+            from paddlefleet.tilelang_ops import csa_indexer_bwd as tl_bwd
+
+            self.tl_bwd = tl_bwd
+
+    def _make_packed(self, doc_lens, ratio=4, h=64, d=128, topk=128, seed=0):
+        from paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn import (
+            cudnn_indexer_topk_fwd,
+        )
+        from paddlefleet.transformer.csa_attention import get_valid_range
+
+        paddle.seed(seed)
+        sq = sum(doc_lens)
+        n_comp = sq // ratio
+        ends, acc = [], 0
+        for dl in doc_lens:
+            acc += dl
+            ends.extend([acc] * dl)
+        startend = paddle.to_tensor(ends, dtype="int32").reshape([1, sq, 1])
+        valid_range = get_valid_range(ratio, 1, sq, startend)
+
+        index_q = paddle.randn([1, sq, h, d]).astype("bfloat16")
+        index_k = paddle.randn([1, n_comp, d]).astype("bfloat16")
+        weights = paddle.randn([1, sq, h]).astype("bfloat16")
+        topk_idx, _ = cudnn_indexer_topk_fwd(
+            index_q,
+            index_k,
+            weights,
+            ratio=ratio,
+            topk_effective=topk,
+            valid_range=valid_range,
+        )
+        # target / topk_probs as masked-softmax over the valid slots, with
+        # fully-invalid (padding) rows zeroed — exactly the production contract
+        # from _compute_tilelang_csa_indexer_loss_forward. The per-row sum over
+        # valid slots is 1, which is what makes cuDNN's clipped-log KL
+        # grad_signal reduce to the linear scale*(predict - target) the
+        # autograd reference uses.
+        valid = topk_idx >= 0
+        row_valid = valid.any(axis=-1, keepdim=True)
+        neg_inf = paddle.full([1], float("-inf"), dtype="float32")
+
+        def _masked_softmax(seed_shift):
+            paddle.seed(seed + seed_shift)
+            logits = paddle.randn([1, sq, topk]).astype("float32")
+            logits = paddle.where(
+                valid, logits, neg_inf.broadcast_to(logits.shape)
+            )
+            logits = paddle.where(row_valid, logits, paddle.zeros_like(logits))
+            p = paddle.nn.functional.softmax(logits, axis=-1)
+            return p * row_valid.cast("float32")
+
+        target = _masked_softmax(101)
+        topk_probs = _masked_softmax(202)
+        return index_q, index_k, weights, topk_idx, target, topk_probs, n_comp
+
+    def _check(self, doc_lens, seed, ratio=4, topk=128):
+        loss_coeff = 0.01
+        gl = paddle.to_tensor(1.0, dtype="float32")
+        iq, ik, w, ti, tgt, tp, _ = self._make_packed(
+            doc_lens, ratio=ratio, topk=topk, seed=seed
+        )
+
+        gq_ref, gw_ref, gk_ref = _ref_indexer_bwd_autograd(
+            iq, w, ik, ti, tgt, tp, loss_coeff, gl, ratio
+        )
+
+        gq_c, gw_c, gk_c = self.cudnn_bwd(
+            iq.clone(),
+            w.clone(),
+            ik.clone(),
+            tgt.clone(),
+            tp.clone(),
+            ti.clone(),
+            loss_coeff=loss_coeff,
+            grad_loss=gl,
+        )
+        for name, a, r in (
+            ("cudnn d_index_q", gq_c, gq_ref),
+            ("cudnn d_weights", gw_c, gw_ref),
+            ("cudnn d_index_k", gk_c, gk_ref),
+        ):
+            cos, rms = _cos_rms(a, r)
+            self.assertGreaterEqual(cos, 0.97, f"{name}: cos {cos:.4f}")
+            self.assertLessEqual(rms, 0.55, f"{name}: rms_rel {rms:.4f}")
+
+        if self.has_tl:
+            grad_scores = (tp - tgt) * (loss_coeff / float(sum(doc_lens)))
+            gq_t, gw_t, gk_t = self.tl_bwd(
+                iq.clone(),
+                w.clone(),
+                ik.clone(),
+                ti.clone(),
+                grad_scores.clone(),
+            )
+            for name, a, r in (
+                ("tilelang d_index_q", gq_t, gq_ref),
+                ("tilelang d_weights", gw_t, gw_ref),
+                ("tilelang d_index_k", gk_t, gk_ref),
+            ):
+                cos, rms = _cos_rms(a, r)
+                self.assertGreaterEqual(cos, 0.97, f"{name}: cos {cos:.4f}")
+                self.assertLessEqual(rms, 0.55, f"{name}: rms_rel {rms:.4f}")
+
+    def test_two_docs_ratio4(self):
+        self._check([23, 9], seed=7)
+
+    def test_three_docs_uneven(self):
+        self._check([40, 28, 60], seed=11)
+
+    def test_deterministic_path(self):
+        old = paddle.get_flags(["FLAGS_cudnn_deterministic"])[
+            "FLAGS_cudnn_deterministic"
+        ]
+        paddle.set_flags({"FLAGS_cudnn_deterministic": 1})
+        try:
+            self._check([23, 9], seed=7)
+        finally:
+            paddle.set_flags({"FLAGS_cudnn_deterministic": old})
 
 
 if __name__ == "__main__":
