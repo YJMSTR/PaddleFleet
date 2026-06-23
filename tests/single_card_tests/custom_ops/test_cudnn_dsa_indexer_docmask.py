@@ -412,6 +412,120 @@ class TestCudnnIndexerTopkDocmask(unittest.TestCase):
         idx_b, _ = cudnn_indexer_topk(scores, sq, ratio, topk)
         self.assertTrue(paddle.equal_all(idx_a, idx_b).item())
 
+    def test_thd_docmask_matches_bshd_docmask_for_aligned_docs(self):
+        """THD fast path must match the existing packed-BSHD docmask path."""
+        from paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn import (
+            cudnn_indexer_topk_fwd,
+        )
+        from paddlefleet.transformer.csa_attention import get_valid_range
+
+        paddle.seed(17)
+        ratio, topk, h, d = 4, 8, 64, 128
+        doc_lens = [16, 24, 8]
+        sq = sum(doc_lens)
+        sk = sum(length // ratio for length in doc_lens)
+        ends = []
+        offset = 0
+        for length in doc_lens:
+            offset += length
+            ends.extend([offset] * length)
+        startend = paddle.to_tensor(ends, dtype="int32").reshape([1, sq, 1])
+        valid_range = get_valid_range(ratio, 1, sq, startend)
+        index_q = paddle.randn([1, sq, h, d]).astype("bfloat16")
+        index_k = paddle.randn([1, sk, d]).astype("bfloat16")
+        weights = paddle.randn([1, sq, h]).astype("bfloat16")
+
+        thd_idx, thd_len, _ = cudnn_indexer_topk_fwd(
+            index_q,
+            index_k,
+            weights,
+            ratio=ratio,
+            topk_effective=topk,
+            valid_range=valid_range,
+            startend_row_indices=startend,
+            return_topk_scores=True,
+        )
+        bshd_idx, bshd_len, _ = cudnn_indexer_topk_fwd(
+            index_q,
+            index_k,
+            weights,
+            ratio=ratio,
+            topk_effective=topk,
+            valid_range=valid_range,
+            return_topk_scores=True,
+        )
+
+        self.assertTrue(paddle.equal_all(thd_len, bshd_len).item())
+        thd_np = thd_idx.numpy()[0]
+        bshd_np = bshd_idx.numpy()[0]
+        for q in range(sq):
+            self.assertEqual(
+                {int(x) for x in thd_np[q] if x >= 0},
+                {int(x) for x in bshd_np[q] if x >= 0},
+                f"query {q}: THD {thd_np[q]} != BSHD {bshd_np[q]}",
+            )
+
+    def test_thd_docmask_drops_non_ratio_aligned_query_tails(self):
+        """THD pre-processing drops per-document query tails before kernel entry."""
+        from paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn import (
+            cudnn_indexer_topk_fwd,
+        )
+        from paddlefleet.transformer.csa_attention import get_valid_range
+
+        paddle.seed(19)
+        ratio, topk, h, d = 4, 8, 64, 128
+        doc_lens = [23, 9]
+        sq = sum(doc_lens)
+        sk = max((sq + ratio - 1) // ratio, sum(length // ratio for length in doc_lens))
+        ends = []
+        offset = 0
+        for length in doc_lens:
+            offset += length
+            ends.extend([offset] * length)
+        startend = paddle.to_tensor(ends, dtype="int32").reshape([1, sq, 1])
+        valid_range = get_valid_range(ratio, 1, sq, startend)
+        clipped_vr_np = valid_range.numpy()
+        doc_start = 0
+        for length in doc_lens:
+            aligned = (length // ratio) * ratio
+            clipped_vr_np[0, doc_start + aligned : doc_start + length, :] = 0
+            doc_start += length
+        clipped_valid_range = paddle.to_tensor(clipped_vr_np, dtype="int32")
+
+        index_q = paddle.randn([1, sq, h, d]).astype("bfloat16")
+        index_k = paddle.randn([1, sk, d]).astype("bfloat16")
+        weights = paddle.randn([1, sq, h]).astype("bfloat16")
+
+        thd_idx, thd_len, _ = cudnn_indexer_topk_fwd(
+            index_q,
+            index_k,
+            weights,
+            ratio=ratio,
+            topk_effective=topk,
+            valid_range=valid_range,
+            startend_row_indices=startend,
+            return_topk_scores=True,
+        )
+        bshd_idx, bshd_len, _ = cudnn_indexer_topk_fwd(
+            index_q,
+            index_k,
+            weights,
+            ratio=ratio,
+            topk_effective=topk,
+            valid_range=clipped_valid_range,
+            return_topk_scores=True,
+        )
+
+        self.assertTrue(paddle.equal_all(thd_len, bshd_len).item())
+        thd_np = thd_idx.numpy()[0]
+        bshd_np = bshd_idx.numpy()[0]
+        for q in range(sq):
+            self.assertEqual(
+                {int(x) for x in thd_np[q] if x >= 0},
+                {int(x) for x in bshd_np[q] if x >= 0},
+                f"query {q}: THD {thd_np[q]} != clipped BSHD {bshd_np[q]}",
+            )
+
 
 def _bwd_inputs(b, sq, sk, h, d, topk, seed):
     paddle.seed(seed)

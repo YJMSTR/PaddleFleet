@@ -699,6 +699,7 @@ def _compute_fused_csa_indexer_loss_forward(
     indexer_backend: str = "tilelang",
     loss_mask: Tensor | None = None,
     global_valid_count: float | None = None,
+    startend_row_indices: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     from paddlefleet.tilelang_ops import (
         csa_attn_target_reducesum,
@@ -707,34 +708,20 @@ def _compute_fused_csa_indexer_loss_forward(
 
     if indexer_backend == "cudnn":
         from paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn import (
-            cudnn_indexer_forward,
-            cudnn_indexer_topk,
+            cudnn_indexer_topk_fwd,
         )
 
-        scores = cudnn_indexer_forward(
-            index_q, index_k_comp, weights, ratio=int(ratio)
-        )
-        topk_indices, _ = cudnn_indexer_topk(
-            scores,
-            int(index_q.shape[1]),
-            int(ratio),
-            int(topk_effective),
+        topk_indices, _, topk_scores = cudnn_indexer_topk_fwd(
+            index_q,
+            index_k_comp,
+            weights,
+            ratio=int(ratio),
+            topk_effective=int(topk_effective),
             valid_range=valid_range,
+            startend_row_indices=startend_row_indices,
+            return_topk_scores=True,
         )
-        # Gather scores at topk positions and softmax to get probs
-        # topk_indices: [B, Sq, topk], scores: [B, Sq, Sk]
         invalid_mask = topk_indices < 0
-        safe_indices = paddle.where(
-            invalid_mask, paddle.zeros_like(topk_indices), topk_indices
-        )
-        topk_scores = paddle.take_along_axis(
-            scores, safe_indices.cast("int64"), axis=2
-        )
-        topk_scores = paddle.where(
-            invalid_mask,
-            paddle.full_like(topk_scores, float("-inf")),
-            topk_scores,
-        )
         # Avoid NaN from softmax on all-(-inf) rows: zero them before softmax.
         row_valid = (~invalid_mask).any(axis=-1, keepdim=True)  # [B, Sq, 1]
         topk_scores = paddle.where(
@@ -1614,6 +1601,7 @@ class CompressedSparseAttention(FleetLayer):
                 indexer_backend=backend,
                 loss_mask=loss_mask,
                 global_valid_count=global_valid_count,
+                startend_row_indices=startend_row_indices,
             )
             loss_state = (
                 q_indexer_bf,
@@ -2057,6 +2045,12 @@ class CompressedSparseAttention(FleetLayer):
                 indexer_backend = getattr(
                     self.config, "csa_indexer_backend", "tilelang"
                 )
+                if indexer_backend == "cudnn":
+                    raise NotImplementedError(
+                        "csa_indexer_backend='cudnn' is not supported in CP "
+                        "mode yet. Use the TileLang indexer backend or disable "
+                        "context parallelism."
+                    )
                 use_tilelang_indexer = indexer_backend == "tilelang"
                 use_tilelang_loss_path = (
                     use_tilelang_indexer
