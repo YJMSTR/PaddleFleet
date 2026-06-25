@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 import paddle
 from paddle import Tensor, nn
 from paddle.distributed.fleet.meta_parallel import LayerSpec, build_spec_layer
+from paddle.profiler import RecordEvent
 
 from paddlefleet.fp8.qat import fp8_simulate_qat
 from paddlefleet.models.common.embeddings.rope_utils import (
@@ -43,6 +44,7 @@ from paddlefleet.models.common.embeddings.yarn_rotary_pos_embedding import (
     YarnRotaryEmbedding,
 )
 from paddlefleet.transformer.attention import Attention
+from paddlefleet.transformer.csa_attention import CSADocMaskMetadata
 
 if TYPE_CHECKING:
     from paddlefleet.process_groups_config import ProcessGroupCollection
@@ -65,37 +67,41 @@ def build_document_rope_freqs(
     sq: int,
     startend_row_indices: Tensor,
     position_offset: int = 0,
+    doc_lens: Tensor | None = None,
 ):
     """Build RoPE frequencies that restart from zero for each document."""
-    assert (
-        startend_row_indices.shape[0] == 1
-        and startend_row_indices.shape[1] == 1
-    ), "Document RoPE currently expects batch_size == 1 and head == 1."
+    with RecordEvent("dsv4_document_rope_freqs"):
+        assert (
+            startend_row_indices.shape[0] == 1
+            and startend_row_indices.shape[1] == 1
+        ), "Document RoPE currently expects batch_size == 1 and head == 1."
 
-    doc_lens = get_doc_lens(startend_row_indices)
-    max_doc_len = int(doc_lens.max().item())
-    _rope_result = rotary_pos_emb(max_doc_len, packed_seq=False)
-    if isinstance(_rope_result, tuple):
-        freqs, mscale = _rope_result
-    else:
-        freqs, mscale = _rope_result, 1.0
-    freqs = freqs.squeeze(0).squeeze(1)
-    doc_freqs = [freqs[:doc_len] for doc_len in doc_lens.tolist()]
-    freqs = paddle.concat(doc_freqs, axis=0)
-    needed_len = position_offset + sq
-    if freqs.shape[0] < needed_len:
-        freqs = paddle.concat(
-            [
-                freqs,
-                paddle.zeros(
-                    [needed_len - freqs.shape[0], freqs.shape[-1]],
-                    dtype=freqs.dtype,
-                ),
-            ],
-            axis=0,
-        )
+        if doc_lens is None:
+            with RecordEvent("dsv4_document_rope_get_doc_lens"):
+                doc_lens = get_doc_lens(startend_row_indices)
+        max_doc_len = int(doc_lens.max().item())
+        _rope_result = rotary_pos_emb(max_doc_len, packed_seq=False)
+        if isinstance(_rope_result, tuple):
+            freqs, mscale = _rope_result
+        else:
+            freqs, mscale = _rope_result, 1.0
+        freqs = freqs.squeeze(0).squeeze(1)
+        doc_freqs = [freqs[:doc_len] for doc_len in doc_lens.tolist()]
+        freqs = paddle.concat(doc_freqs, axis=0)
+        needed_len = position_offset + sq
+        if freqs.shape[0] < needed_len:
+            freqs = paddle.concat(
+                [
+                    freqs,
+                    paddle.zeros(
+                        [needed_len - freqs.shape[0], freqs.shape[-1]],
+                        dtype=freqs.dtype,
+                    ),
+                ],
+                axis=0,
+            )
 
-    return freqs.reshape([1, -1, 1, freqs.shape[-1]]), mscale
+        return freqs.reshape([1, -1, 1, freqs.shape[-1]]), mscale
 
 
 # ---------------------------------------------------------------------------
@@ -278,14 +284,23 @@ class DSv4HybridAttention(Attention):
             if cp_pg is not None and cp_size > 1
             else 0
         )
-        _, sq, _ = hidden_states.shape
+        b, sq, _ = hidden_states.shape
         position_offset = cp_rank * sq if cp_size > 1 else 0
+        docmask_meta = None
+        if startend_row_indices is not None:
+            docmask_meta = CSADocMaskMetadata.build(
+                max(1, int(getattr(self.core_attention, "compress_ratio", 1))),
+                b,
+                sq * cp_size,
+                startend_row_indices,
+            )
 
         query, key, value, q_compressed, kv_compressed = (
             self.get_query_key_value_tensors(
                 hidden_states=hidden_states,
                 startend_row_indices=startend_row_indices,
                 position_offset=position_offset,
+                docmask_meta=docmask_meta,
             )
         )
 
@@ -299,7 +314,8 @@ class DSv4HybridAttention(Attention):
             attention_mask,
             x=hidden_states,
             qr=q_compressed,
-            input_ids=kwargs.get("input_ids", None),
+            input_ids=input_ids,
+            docmask_meta=docmask_meta,
         )
         # core_attn_out: [b, sq, np * v_head_dim]
 
@@ -319,6 +335,11 @@ class DSv4HybridAttention(Attention):
                     sq,
                     startend_row_indices,
                     position_offset=position_offset,
+                    doc_lens=(
+                        docmask_meta.doc_lens
+                        if docmask_meta is not None
+                        else None
+                    ),
                 )
             else:
                 # Get RoPE frequencies for inverse; use global positions in CP mode
@@ -377,7 +398,11 @@ class DSv4HybridAttention(Attention):
         return output, bias
 
     def get_query_key_value_tensors(
-        self, hidden_states: Tensor, startend_row_indices: Tensor | None = None
+        self,
+        hidden_states: Tensor,
+        startend_row_indices: Tensor | None = None,
+        position_offset: int = 0,
+        docmask_meta: CSADocMaskMetadata | None = None,
     ):
         """Override in subclass."""
         raise NotImplementedError
@@ -482,11 +507,13 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         hidden_states: Tensor,
         startend_row_indices: Tensor | None = None,
         position_offset: int = 0,
+        docmask_meta: CSADocMaskMetadata | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Derive query, key, value from hidden_states.
 
         Args:
             hidden_states: [b, sq, hidden_size]
+            startend_row_indices: document boundary tensor, or None.
             position_offset: global position offset for CP (cp_rank * sq_local).
                 When non-zero, RoPE frequencies are sliced from the correct
                 global starting position.
@@ -526,6 +553,11 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     sq,
                     startend_row_indices,
                     position_offset=position_offset,
+                    doc_lens=(
+                        docmask_meta.doc_lens
+                        if docmask_meta is not None
+                        else None
+                    ),
                 )
             else:
                 # Get RoPE frequencies for global positions

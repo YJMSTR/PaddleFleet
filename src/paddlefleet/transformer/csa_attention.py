@@ -33,6 +33,7 @@ import paddle
 import paddle.nn.functional as F
 from paddle import Tensor, nn
 from paddle.distributed.fleet.meta_parallel import LayerSpec, build_spec_layer
+from paddle.profiler import RecordEvent
 
 from paddlefleet.models.common.embeddings.rope_utils import (
     _apply_rotary_pos_emb_bshd,
@@ -103,6 +104,212 @@ def get_cutoff_doc_starts(cutoff_doc_lens: Tensor) -> Tensor:
     if cum.shape[0] > 1:
         starts[1:] = cum[:-1]
     return starts
+
+
+@dataclass
+class CSADocMaskMetadata:
+    """Reusable CSA metadata derived from startend_row_indices."""
+
+    startend_row_indices: Tensor
+    ratio: int
+    batch_size: int
+    seqlen: int
+    n_compressed: int
+    doc_lens: Tensor
+    doc_starts: Tensor
+    doc_lens_cutoff: Tensor
+    doc_starts_cutoff: Tensor
+    total_cutoff: int
+    actual_n_compressed: int
+    positions: Tensor
+    doc_start_per_pos: Tensor
+    pos_in_doc: Tensor
+    doc_len_per_pos: Tensor
+    is_valid: Tensor
+    num_compressed_per_pos: Tensor
+    doc_col_start: Tensor
+    num_available: Tensor
+    range_start: Tensor
+    range_end: Tensor
+    valid_range: Tensor
+    _window_topk_idxs: Tensor | None = None
+    _window_size: int | None = None
+    _compress_topk_idxs: Tensor | None = None
+    _compress_offset: int | None = None
+    _compressed_causal_mask: Tensor | None = None
+    _is_first_compressed_group: Tensor | None = None
+
+    @classmethod
+    def build(
+        cls,
+        ratio: int,
+        batch_size: int,
+        seqlen: int,
+        startend_row_indices: Tensor | None,
+        n_compressed: int | None = None,
+    ) -> CSADocMaskMetadata | None:
+        with RecordEvent("csa_docmask_meta_build"):
+            if startend_row_indices is None:
+                return None
+            if batch_size != 1:
+                raise ValueError(
+                    f"only support batch_size = 1, got batch_size: {batch_size}"
+                )
+            if n_compressed is None:
+                n_compressed = seqlen // ratio
+
+            mask = startend_row_indices.flatten().cast("int64")
+            positions = paddle.arange(seqlen, dtype="int64")
+
+            is_boundary = paddle.zeros([seqlen], dtype="int64")
+            is_boundary[0] = 1
+            is_boundary[1:] = (
+                (positions[1:] == mask[:-1]) & (mask[1:] != mask[:-1])
+            ).cast("int64")
+
+            start_marker = is_boundary * positions
+            doc_start_per_pos = paddle.cummax(start_marker, axis=0).values
+            pos_in_doc = positions - doc_start_per_pos
+            doc_len_per_pos = mask - doc_start_per_pos
+            is_valid = pos_in_doc < doc_len_per_pos
+
+            doc_lens = get_doc_lens(startend_row_indices)
+            doc_starts = get_doc_starts(doc_lens)
+            doc_lens_cutoff = get_cutoff_doc_lens(doc_lens, ratio)
+            doc_starts_cutoff = get_cutoff_doc_starts(doc_lens_cutoff)
+            total_cutoff = int(doc_lens_cutoff.sum().item())
+            actual_n_compressed = total_cutoff // ratio
+
+            cutoff_doc_len = (doc_len_per_pos // ratio) * ratio
+            num_compressed_per_pos = cutoff_doc_len // ratio
+            boundary_compressed = is_boundary * num_compressed_per_pos
+            cum_compressed = paddle.cumsum(boundary_compressed, axis=0)
+            doc_col_start = cum_compressed - num_compressed_per_pos
+
+            causal_avail = (pos_in_doc + 1) // ratio
+            num_available = paddle.minimum(causal_avail, num_compressed_per_pos)
+            range_start = doc_col_start
+            range_end = doc_col_start + num_available
+            zero_mask = (num_available == 0) | (~is_valid)
+            range_start = paddle.where(
+                zero_mask, paddle.zeros_like(range_start), range_start
+            )
+            range_end = paddle.where(
+                zero_mask, paddle.zeros_like(range_end), range_end
+            )
+            valid_range = paddle.stack([range_start, range_end], axis=-1).cast(
+                "int32"
+            )
+
+            return cls(
+                startend_row_indices=startend_row_indices,
+                ratio=ratio,
+                batch_size=batch_size,
+                seqlen=seqlen,
+                n_compressed=n_compressed,
+                doc_lens=doc_lens,
+                doc_starts=doc_starts,
+                doc_lens_cutoff=doc_lens_cutoff,
+                doc_starts_cutoff=doc_starts_cutoff,
+                total_cutoff=total_cutoff,
+                actual_n_compressed=actual_n_compressed,
+                positions=positions,
+                doc_start_per_pos=doc_start_per_pos,
+                pos_in_doc=pos_in_doc,
+                doc_len_per_pos=doc_len_per_pos,
+                is_valid=is_valid,
+                num_compressed_per_pos=num_compressed_per_pos,
+                doc_col_start=doc_col_start,
+                num_available=num_available,
+                range_start=range_start,
+                range_end=range_end,
+                valid_range=valid_range.unsqueeze(0),
+            )
+
+    def get_window_topk_idxs(self, window_size: int) -> Tensor:
+        with RecordEvent("csa_docmask_get_window_topk_idxs"):
+            if (
+                self._window_topk_idxs is None
+                or self._window_size != window_size
+            ):
+                with RecordEvent("csa_docmask_compute_window_topk_idxs"):
+                    win_start = paddle.maximum(
+                        self.doc_start_per_pos, self.positions - window_size + 1
+                    )
+                    offsets = paddle.arange(
+                        window_size, dtype="int64"
+                    ).unsqueeze(0)
+                    indices = win_start.unsqueeze(1) + offsets
+                    invalid = (
+                        (indices > self.positions.unsqueeze(1))
+                        | (indices < self.doc_start_per_pos.unsqueeze(1))
+                        | (~self.is_valid).unsqueeze(1).expand_as(indices)
+                    )
+                    result = paddle.where(
+                        invalid, paddle.full_like(indices, -1), indices
+                    )
+                    self._window_topk_idxs = result.unsqueeze(0).expand(
+                        [self.batch_size, -1, -1]
+                    )
+                    self._window_size = window_size
+            return self._window_topk_idxs
+
+    def get_compress_topk_idxs(self, offset: int) -> Tensor:
+        with RecordEvent("csa_docmask_get_compress_topk_idxs"):
+            if (
+                self._compress_topk_idxs is None
+                or self._compress_offset != offset
+            ):
+                with RecordEvent("csa_docmask_compute_compress_topk_idxs"):
+                    c_grid = paddle.arange(
+                        self.n_compressed, dtype="int64"
+                    ).unsqueeze(0)
+                    active = (c_grid >= self.range_start.unsqueeze(1)) & (
+                        c_grid < self.range_end.unsqueeze(1)
+                    )
+                    result = paddle.where(
+                        active,
+                        (c_grid + offset).cast("int32"),
+                        paddle.full(
+                            [self.seqlen, self.n_compressed], -1, dtype="int32"
+                        ),
+                    )
+                    self._compress_topk_idxs = result.unsqueeze(0).expand(
+                        [self.batch_size, -1, -1]
+                    )
+                    self._compress_offset = offset
+            return self._compress_topk_idxs
+
+    def get_compressed_causal_mask(self) -> Tensor:
+        with RecordEvent("csa_docmask_get_compressed_causal_mask"):
+            if self._compressed_causal_mask is None:
+                with RecordEvent("csa_docmask_compute_compressed_causal_mask"):
+                    c_grid = paddle.arange(
+                        self.n_compressed, dtype="int64"
+                    ).unsqueeze(0)
+                    valid_mask = (c_grid >= self.range_start.unsqueeze(1)) & (
+                        c_grid < self.range_end.unsqueeze(1)
+                    )
+                    invalid = ~valid_mask
+                    invalid = invalid.unsqueeze(0).expand(
+                        [self.batch_size, self.seqlen, self.n_compressed]
+                    )
+                    self._compressed_causal_mask = paddle.where(
+                        invalid,
+                        paddle.full([1], float("-inf"), dtype="float32"),
+                        paddle.zeros([1], dtype="float32"),
+                    )
+            return self._compressed_causal_mask
+
+    def get_is_first_compressed_group(self) -> Tensor:
+        if self._is_first_compressed_group is None:
+            is_first = paddle.zeros([self.actual_n_compressed], dtype="bool")
+            for i in range(len(self.doc_starts_cutoff)):
+                idx = int(self.doc_starts_cutoff[i].item()) // self.ratio
+                if idx < self.actual_n_compressed:
+                    is_first[idx] = True
+            self._is_first_compressed_group = is_first
+        return self._is_first_compressed_group
 
 
 def get_compress_topk_idxs(
@@ -1019,6 +1226,7 @@ class Compressor(nn.Layer):
         x: Tensor,
         startend_row_indices: Tensor | None = None,
         cp_group=None,
+        docmask_meta: CSADocMaskMetadata | None = None,
     ) -> Tensor | None:
         """Compress hidden states into shorter KV sequence.
 
@@ -1054,19 +1262,22 @@ class Compressor(nn.Layer):
         # Shared compression logic for both CP and non-CP paths.
         if startend_row_indices is not None:
             # per-document cutoff, pack contiguously without padding
-            doc_lens = get_doc_lens(startend_row_indices)
-            doc_starts = get_doc_starts(doc_lens)
-
-            doc_lens_cutoff = get_cutoff_doc_lens(doc_lens, ratio)
-            doc_starts_cutoff = get_cutoff_doc_starts(doc_lens_cutoff)
+            if docmask_meta is None or docmask_meta.seqlen != sq:
+                docmask_meta = CSADocMaskMetadata.build(
+                    ratio, b, sq, startend_row_indices
+                )
+            doc_lens = docmask_meta.doc_lens
+            doc_starts = docmask_meta.doc_starts
+            doc_lens_cutoff = docmask_meta.doc_lens_cutoff
+            doc_starts_cutoff = docmask_meta.doc_starts_cutoff
 
             assert len(doc_lens) == len(doc_starts)
             assert len(doc_lens) == len(doc_lens_cutoff)
             assert len(doc_lens) == len(doc_starts_cutoff)
 
             n_compressed = sq // ratio
-            total_cutoff = int(doc_lens_cutoff.sum().item())
-            actual_n_compressed = total_cutoff // ratio
+            total_cutoff = docmask_meta.total_cutoff
+            actual_n_compressed = docmask_meta.actual_n_compressed
             coff_head_dim = kv.shape[-1]
 
             # Pack only valid cutoff data contiguously (no padding)
@@ -1103,12 +1314,7 @@ class Compressor(nn.Layer):
             score = score + ape
 
             if self.overlap:
-                # Build is_first mask for document boundaries
-                is_first = paddle.zeros([actual_n_compressed], dtype="bool")
-                for i in range(len(doc_starts_cutoff)):
-                    idx = int(doc_starts_cutoff[i].item()) // ratio
-                    if idx < actual_n_compressed:
-                        is_first[idx] = True
+                is_first = docmask_meta.get_is_first_compressed_group()
                 kv = self._overlap_transform(
                     kv, fill_value=0, is_first=is_first
                 )
@@ -1311,6 +1517,7 @@ class CSAIndexer(nn.Layer):
         startend_row_indices: Tensor | None = None,
         position_offset: int = 0,
         cp_group=None,
+        docmask_meta: CSADocMaskMetadata | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Compute Q, compressed K, and weights before top-k selection.
 
@@ -1318,11 +1525,9 @@ class CSAIndexer(nn.Layer):
         compressor so that indexer K is computed over the full global sequence.
         """
         b, sq, _ = x.shape
-        doc_lens = (
-            get_doc_lens(startend_row_indices)
-            if startend_row_indices is not None
-            else None
-        )
+        doc_lens = docmask_meta.doc_lens if docmask_meta is not None else None
+        if doc_lens is None and startend_row_indices is not None:
+            doc_lens = get_doc_lens(startend_row_indices)
         # Q path
         q, _ = self.linear_wq_b(qr)  # [b, sq, n_heads * head_dim]
         q = q.reshape([b, sq, self.index_n_heads, self.index_head_dim])
@@ -1349,6 +1554,7 @@ class CSAIndexer(nn.Layer):
             x,
             startend_row_indices=startend_row_indices,
             cp_group=cp_group,
+            docmask_meta=docmask_meta,
         )  # [b, n_compressed, index_head_dim]
 
         # Weights
@@ -1363,6 +1569,7 @@ class CSAIndexer(nn.Layer):
         qr: Tensor,
         startend_row_indices: Tensor | None = None,
         mask: Tensor | None = None,
+        docmask_meta: CSADocMaskMetadata | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Return (index_scores, topk_indices).
 
@@ -1376,7 +1583,9 @@ class CSAIndexer(nn.Layer):
             index_scores: [b, sq, n_compressed]
             topk_indices: [b, sq, topk]
         """
-        q, k, weights = self.forward_before_topk(x, qr, startend_row_indices)
+        q, k, weights = self.forward_before_topk(
+            x, qr, startend_row_indices, docmask_meta=docmask_meta
+        )
         effective_topk = min(self.index_topk, k.shape[1])
         weights = (
             weights * self.softmax_scale
@@ -1505,6 +1714,7 @@ class CompressedSparseAttention(FleetLayer):
         startend_row_indices: Tensor | None = None,
         loss_mask: Tensor | None = None,
         global_valid_count: float | None = None,
+        docmask_meta: CSADocMaskMetadata | None = None,
     ) -> tuple[Tensor, Tensor | None, tuple | None]:
         """Build indexer-selected compressed KV indices and loss state."""
         b, sq, np_heads, _ = query.shape
@@ -1539,20 +1749,23 @@ class CompressedSparseAttention(FleetLayer):
             n_compressed,
         )
 
-        causal_mask = _build_compressed_causal_mask(
-            self.compress_ratio,
-            b,
-            sq,
-            n_compressed,
-            startend_row_indices,
-        )
-
-        valid_range = get_valid_range(
-            int(self.compress_ratio),
-            b,
-            sq,
-            startend_row_indices,
-        )
+        if docmask_meta is not None:
+            causal_mask = docmask_meta.get_compressed_causal_mask()
+            valid_range = docmask_meta.valid_range
+        else:
+            causal_mask = _build_compressed_causal_mask(
+                self.compress_ratio,
+                b,
+                sq,
+                n_compressed,
+                startend_row_indices,
+            )
+            valid_range = get_valid_range(
+                int(self.compress_ratio),
+                b,
+                sq,
+                startend_row_indices,
+            )
 
         def compute_fused_indexer_loss(backend: str):
             # Training grad-enabled forward with TileLang/cuDNN backend.
@@ -1563,7 +1776,10 @@ class CompressedSparseAttention(FleetLayer):
             )
             q_indexer_bf, k_indexer_bf, weights_indexer_bf = (
                 self.indexer.forward_before_topk(
-                    x_det, qr_det, startend_row_indices
+                    x_det,
+                    qr_det,
+                    startend_row_indices,
+                    docmask_meta=docmask_meta,
                 )
             )
             key_comp_mla = compressed_kv.detach()
@@ -1627,7 +1843,10 @@ class CompressedSparseAttention(FleetLayer):
                 with paddle.no_grad():
                     q_indexer_cu, k_indexer_cu, weights_indexer_cu = (
                         self.indexer.forward_before_topk(
-                            x_det, qr_det, startend_row_indices
+                            x_det,
+                            qr_det,
+                            startend_row_indices,
+                            docmask_meta=docmask_meta,
                         )
                     )
                     cu_topk_indices, _cu_topk_length = cudnn_indexer_topk_fwd(
@@ -1654,7 +1873,10 @@ class CompressedSparseAttention(FleetLayer):
                 with paddle.no_grad():
                     q_indexer_tl, k_indexer_tl, weights_indexer_tl = (
                         self.indexer.forward_before_topk(
-                            x_det, qr_det, startend_row_indices
+                            x_det,
+                            qr_det,
+                            startend_row_indices,
+                            docmask_meta=docmask_meta,
                         )
                     )
                     tl_topk_indices, _tl_topk_scores = csa_indexer_topk_fwd(
@@ -1673,7 +1895,10 @@ class CompressedSparseAttention(FleetLayer):
             if need_indexer_loss:  # Grad-enabled recompute forward; compute Paddle indexer loss and top-k.
                 q_indexer, k_indexer, weights_indexer = (
                     self.indexer.forward_before_topk(
-                        x_det, qr_det, startend_row_indices
+                        x_det,
+                        qr_det,
+                        startend_row_indices,
+                        docmask_meta=docmask_meta,
                     )
                 )
                 indexer_loss_coeff = getattr(
@@ -1717,6 +1942,7 @@ class CompressedSparseAttention(FleetLayer):
                     qr_det,
                     startend_row_indices,
                     mask=causal_mask,
+                    docmask_meta=docmask_meta,
                 )
 
         if (
@@ -1726,12 +1952,19 @@ class CompressedSparseAttention(FleetLayer):
                 ..., :attn_topk_effective
             ].contiguous()
 
-        compress_topk_idxs = _map_compressed_topk_to_kv_full(
-            topk_indices_compressed,
-            sq,
-            self.compress_ratio,
-            offset,
-        )
+        if docmask_meta is not None:
+            compress_topk_idxs = paddle.where(
+                topk_indices_compressed >= 0,
+                topk_indices_compressed + offset,
+                paddle.full_like(topk_indices_compressed, -1),
+            )
+        else:
+            compress_topk_idxs = _map_compressed_topk_to_kv_full(
+                topk_indices_compressed,
+                sq,
+                self.compress_ratio,
+                offset,
+            )
 
         return compress_topk_idxs, indexer_loss, tilelang_indexer_loss_state
 
@@ -1745,6 +1978,7 @@ class CompressedSparseAttention(FleetLayer):
         x: Tensor = None,
         qr: Tensor = None,
         input_ids: Tensor | None = None,
+        docmask_meta: CSADocMaskMetadata | None = None,
     ) -> Tensor:
         """Forward pass for CompressedSparseAttention.
 
@@ -1802,13 +2036,15 @@ class CompressedSparseAttention(FleetLayer):
                 startend_row_indices,
                 loss_mask=loss_mask,
                 global_valid_count=global_valid_count,
+                docmask_meta=docmask_meta,
             )
 
         if startend_row_indices is not None and self.compress_ratio > 1:
-            doc_lens = get_doc_lens(startend_row_indices)
-            doc_lens_cutoff = get_cutoff_doc_lens(doc_lens, self.compress_ratio)
-            total_cutoff = int(doc_lens_cutoff.sum().item())
-            actual_n_compressed = total_cutoff // self.compress_ratio
+            if docmask_meta is None or docmask_meta.seqlen != sq:
+                docmask_meta = CSADocMaskMetadata.build(
+                    self.compress_ratio, b, sq, startend_row_indices
+                )
+            actual_n_compressed = docmask_meta.actual_n_compressed
         elif self.compress_ratio > 1:
             actual_n_compressed = sq // self.compress_ratio
         else:
@@ -1824,7 +2060,9 @@ class CompressedSparseAttention(FleetLayer):
             and actual_n_compressed > 0
         ):
             compressed_kv = self.compressor(
-                x, startend_row_indices
+                x,
+                startend_row_indices,
+                docmask_meta=docmask_meta,
             )  # [b, n_compressed, v_head_dim]
             if compressed_kv is not None:
                 kv_full = paddle.concat([kv, compressed_kv], axis=1)
@@ -1839,9 +2077,12 @@ class CompressedSparseAttention(FleetLayer):
         offset = sq  # compressed indices start after original positions
 
         # Step 3: Window indices
-        window_idxs = get_window_topk_idxs(
-            self.window_size, b, sq, startend_row_indices
-        )
+        if docmask_meta is not None:
+            window_idxs = docmask_meta.get_window_topk_idxs(self.window_size)
+        else:
+            window_idxs = get_window_topk_idxs(
+                self.window_size, b, sq, startend_row_indices
+            )
 
         # Step 4: Compressed indices
         indexer_loss = None
@@ -1867,16 +2108,22 @@ class CompressedSparseAttention(FleetLayer):
                     startend_row_indices,
                     loss_mask=loss_mask,
                     global_valid_count=global_valid_count,
+                    docmask_meta=docmask_meta,
                 )
             else:
                 # ratio=128: attend to all compressed positions
-                compress_topk_idxs = get_compress_topk_idxs(
-                    self.compress_ratio,
-                    b,
-                    sq,
-                    offset,
-                    startend_row_indices,
-                )
+                if docmask_meta is not None:
+                    compress_topk_idxs = docmask_meta.get_compress_topk_idxs(
+                        offset
+                    )
+                else:
+                    compress_topk_idxs = get_compress_topk_idxs(
+                        self.compress_ratio,
+                        b,
+                        sq,
+                        offset,
+                        startend_row_indices,
+                    )
 
             if compress_topk_idxs.dtype != window_idxs.dtype:
                 compress_topk_idxs = compress_topk_idxs.cast(window_idxs.dtype)
@@ -1917,6 +2164,7 @@ class CompressedSparseAttention(FleetLayer):
         startend_row_indices: Tensor | None = None,
         loss_mask: Tensor | None = None,
         global_valid_count: float | None = None,
+        docmask_meta: CSADocMaskMetadata | None = None,
     ) -> Tensor:
         """CP-aware forward: local compress + all-gather, sparse attention.
 
@@ -1945,8 +2193,12 @@ class CompressedSparseAttention(FleetLayer):
                 q_positions, self.window_size, b, sq_global
             )
         else:
-            full_window_idxs = get_window_topk_idxs(
-                self.window_size, b, sq_global, startend_row_indices
+            if docmask_meta is None or docmask_meta.seqlen != sq_global:
+                docmask_meta = CSADocMaskMetadata.build(
+                    self.compress_ratio, b, sq_global, startend_row_indices
+                )
+            full_window_idxs = docmask_meta.get_window_topk_idxs(
+                self.window_size
             )
             window_idxs = full_window_idxs[
                 :, position_offset : position_offset + sq, ...
@@ -1971,10 +2223,11 @@ class CompressedSparseAttention(FleetLayer):
 
         # Compute actual_n_compressed accounting for document boundaries
         if startend_row_indices is not None and self.compress_ratio > 1:
-            doc_lens = get_doc_lens(startend_row_indices)
-            doc_lens_cutoff = get_cutoff_doc_lens(doc_lens, self.compress_ratio)
-            total_cutoff = int(doc_lens_cutoff.sum().item())
-            actual_n_compressed = total_cutoff // self.compress_ratio
+            if docmask_meta is None or docmask_meta.seqlen != sq_global:
+                docmask_meta = CSADocMaskMetadata.build(
+                    self.compress_ratio, b, sq_global, startend_row_indices
+                )
+            actual_n_compressed = docmask_meta.actual_n_compressed
         elif self.compress_ratio > 1:
             actual_n_compressed = n_compressed_global
         else:
@@ -1993,6 +2246,7 @@ class CompressedSparseAttention(FleetLayer):
                 x,
                 startend_row_indices=startend_row_indices,
                 cp_group=self.cp_group,
+                docmask_meta=docmask_meta,
             )
             kv_full = paddle.concat([kv_global, compressed_kv_global], axis=1)
         else:
@@ -2032,13 +2286,7 @@ class CompressedSparseAttention(FleetLayer):
 
                 # valid_range for varlen: [b, sq_local, 2] or None
                 if startend_row_indices is not None:
-                    valid_range_full = get_valid_range(
-                        int(self.compress_ratio),
-                        b,
-                        sq_global,
-                        startend_row_indices,
-                    )
-                    valid_range = valid_range_full[
+                    valid_range = docmask_meta.valid_range[
                         :, position_offset : position_offset + sq, :
                     ]
                 else:
@@ -2051,6 +2299,7 @@ class CompressedSparseAttention(FleetLayer):
                         startend_row_indices=startend_row_indices,
                         position_offset=position_offset,
                         cp_group=self.cp_group,
+                        docmask_meta=docmask_meta,
                     )
                 )
 
@@ -2128,12 +2377,8 @@ class CompressedSparseAttention(FleetLayer):
                             b,
                         )
                     else:
-                        causal_mask_full = _build_compressed_causal_mask(
-                            self.compress_ratio,
-                            b,
-                            sq_global,
-                            n_compressed_global,
-                            startend_row_indices,
+                        causal_mask_full = (
+                            docmask_meta.get_compressed_causal_mask()
                         )
                         causal_mask = causal_mask_full[
                             :, position_offset : position_offset + sq, ...
@@ -2185,12 +2430,8 @@ class CompressedSparseAttention(FleetLayer):
                             b,
                         )
                     else:
-                        causal_mask_full = _build_compressed_causal_mask(
-                            self.compress_ratio,
-                            b,
-                            sq_global,
-                            n_compressed_global,
-                            startend_row_indices,
+                        causal_mask_full = (
+                            docmask_meta.get_compressed_causal_mask()
                         )
                         causal_mask = causal_mask_full[
                             :, position_offset : position_offset + sq, ...
@@ -2246,12 +2487,8 @@ class CompressedSparseAttention(FleetLayer):
                         n_compressed_global,
                     )
                 else:
-                    compress_topk_idxs = get_compress_topk_idxs(
-                        self.compress_ratio,
-                        b,
-                        sq_global,
-                        offset,
-                        startend_row_indices,
+                    compress_topk_idxs = docmask_meta.get_compress_topk_idxs(
+                        offset
                     )
                     compress_topk_idxs = compress_topk_idxs[
                         :, position_offset : position_offset + sq, ...

@@ -34,10 +34,13 @@ from paddlefleet.models.gpt.gpt_layer_specs import (
 from paddlefleet.tensor_parallel.random import model_parallel_cuda_manual_seed
 from paddlefleet.transformer.csa_attention import (
     CompressedSparseAttention,
+    CSADocMaskMetadata,
     _apply_rope,
+    _build_compressed_causal_mask,
     _resolve_csa_indexer_attn_topk_effective,
     _resolve_csa_indexer_loss_topk_effective,
     get_compress_topk_idxs,
+    get_valid_range,
     get_window_topk_idxs,
 )
 from paddlefleet.transformer.dsa_attention import (
@@ -281,7 +284,132 @@ class TestCSAIndexHelpers(unittest.TestCase):
         self.assertEqual(topk_indices.numpy().tolist()[0][0][0], 0)
 
 
+class TestCSADocMaskMetadata(unittest.TestCase):
+    def _make_docmask(self):
+        return paddle.to_tensor(
+            [5, 5, 5, 5, 5, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12],
+            dtype="int32",
+        ).reshape([1, 1, 16, 1])
+
+    def test_metadata_matches_legacy_helpers(self):
+        ratio = 4
+        batch_size = 1
+        seqlen = 16
+        startend_row_indices = self._make_docmask()
+        meta = CSADocMaskMetadata.build(
+            ratio, batch_size, seqlen, startend_row_indices
+        )
+
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta.actual_n_compressed, 2)
+        self.assertTrue(
+            paddle.equal_all(
+                meta.valid_range,
+                get_valid_range(
+                    ratio, batch_size, seqlen, startend_row_indices
+                ),
+            ).item()
+        )
+        self.assertTrue(
+            paddle.equal_all(
+                meta.get_window_topk_idxs(3),
+                get_window_topk_idxs(
+                    3, batch_size, seqlen, startend_row_indices
+                ),
+            ).item()
+        )
+        self.assertTrue(
+            paddle.equal_all(
+                meta.get_compress_topk_idxs(offset=16),
+                get_compress_topk_idxs(
+                    ratio, batch_size, seqlen, 16, startend_row_indices
+                ),
+            ).item()
+        )
+        self.assertTrue(
+            paddle.equal_all(
+                meta.get_compressed_causal_mask(),
+                _build_compressed_causal_mask(
+                    ratio,
+                    batch_size,
+                    seqlen,
+                    seqlen // ratio,
+                    startend_row_indices,
+                ),
+            ).item()
+        )
+
+    def test_metadata_lazy_cache_keys_recompute_when_inputs_change(self):
+        meta = CSADocMaskMetadata.build(4, 1, 16, self._make_docmask())
+
+        window_3 = meta.get_window_topk_idxs(3)
+        self.assertIs(window_3, meta.get_window_topk_idxs(3))
+        window_5 = meta.get_window_topk_idxs(5)
+        self.assertIs(window_5, meta.get_window_topk_idxs(5))
+        self.assertIsNot(window_3, window_5)
+        self.assertTrue(
+            paddle.equal_all(
+                window_5,
+                get_window_topk_idxs(5, 1, 16, self._make_docmask()),
+            ).item()
+        )
+
+        compressed_16 = meta.get_compress_topk_idxs(offset=16)
+        self.assertIs(compressed_16, meta.get_compress_topk_idxs(offset=16))
+        compressed_32 = meta.get_compress_topk_idxs(offset=32)
+        self.assertIs(compressed_32, meta.get_compress_topk_idxs(offset=32))
+        self.assertIsNot(compressed_16, compressed_32)
+        self.assertTrue(
+            paddle.equal_all(
+                compressed_32,
+                get_compress_topk_idxs(4, 1, 16, 32, self._make_docmask()),
+            ).item()
+        )
+
+    def test_metadata_none_when_no_docmask(self):
+        self.assertIsNone(CSADocMaskMetadata.build(4, 1, 16, None))
+
+
 class TestDSv4HybridDocumentRoPE(unittest.TestCase):
+    def test_document_rope_freqs_reuses_supplied_doc_lens(self):
+        config = _make_config(rope_type="yarn")
+        rotary_pos_emb = YarnRotaryEmbedding(
+            config.qk_pos_emb_head_dim,
+            rotary_base=config.csa_compress_rotary_base,
+            scaling_factor=getattr(config, "rotary_scaling_factor", 40),
+            original_max_position_embeddings=getattr(
+                config, "original_max_position_embeddings", 4096
+            ),
+            beta_fast=getattr(config, "beta_fast", 32),
+            beta_slow=getattr(config, "beta_slow", 1),
+            mscale=getattr(config, "mscale", 1.0),
+            mscale_all_dim=getattr(config, "mscale_all_dim", 0.0),
+        )
+        startend_row_indices = paddle.to_tensor(
+            [4, 4, 4, 4, 8, 8, 8, 8], dtype="int32"
+        ).reshape([1, 1, 8, 1])
+        doc_lens = paddle.to_tensor([4, 4], dtype="int32")
+
+        freqs_from_meta, mscale_from_meta = build_document_rope_freqs(
+            rotary_pos_emb,
+            8,
+            startend_row_indices,
+            doc_lens=doc_lens,
+        )
+        freqs_from_mask, mscale_from_mask = build_document_rope_freqs(
+            rotary_pos_emb,
+            8,
+            startend_row_indices,
+        )
+
+        self.assertEqual(mscale_from_meta, mscale_from_mask)
+        self.assertTrue(
+            paddle.equal_all(
+                freqs_from_meta.cast("float32"),
+                freqs_from_mask.cast("float32"),
+            ).item()
+        )
+
     def test_document_rope_freqs_with_position_offset_pads_to_local_slice(self):
         config = _make_config(rope_type="yarn")
         rotary_pos_emb = YarnRotaryEmbedding(
