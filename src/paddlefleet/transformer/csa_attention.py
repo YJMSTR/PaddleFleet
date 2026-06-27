@@ -25,8 +25,12 @@ Components:
 
 from __future__ import annotations
 
+import hashlib
 import os
+import time
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
+from functools import wraps
 from typing import TYPE_CHECKING
 
 import paddle
@@ -71,6 +75,90 @@ from paddlefleet.transformer.cp_utils import (
     map_compressed_topk_to_kv_full_cp,
 )
 
+_CSA_DOCMASK_PROFILE = os.getenv("CSA_DOCMASK_PROFILE", "0") == "1"
+_CSA_DOCMASK_PROFILE_INTERVAL = max(1, int(os.getenv("CSA_DOCMASK_PROFILE_INTERVAL", "20")))
+_CSA_DOCMASK_PROFILE_SYNC = os.getenv("CSA_DOCMASK_PROFILE_SYNC", "1") == "1"
+_CSA_DOCMASK_PROFILE_STATS = defaultdict(lambda: [0, 0.0])
+_CSA_DOCMASK_PROFILE_LOG_TOTAL = 0
+_CSA_DOCMASK_META_CACHE: OrderedDict[tuple, CSADocMaskMetadata] = OrderedDict()
+_CSA_DOCMASK_META_CACHE_LIMIT = max(
+    1,
+    int(os.getenv("PADDLEFLEET_CSA_DOCMASK_META_CACHE_LIMIT", "32")),
+)
+
+
+def _csa_docmask_as_int(value, name: str) -> int:
+    if isinstance(value, Tensor):
+        if value.numel().item() != 1:
+            raise ValueError(f"{name} must be scalar, got shape: {value.shape}")
+        return int(value.item())
+    return int(value)
+
+
+def _csa_docmask_profile_sync() -> None:
+    if _CSA_DOCMASK_PROFILE_SYNC and paddle.device.is_compiled_with_cuda():
+        paddle.device.cuda.synchronize()
+
+
+def _csa_docmask_profile_rank() -> int:
+    for name in ("PADDLE_TRAINER_ID", "PADDLE_RANK_IN_NODE", "RANK"):
+        value = os.getenv(name)
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                return 0
+    return 0
+
+
+def _csa_docmask_profile_log() -> None:
+    global _CSA_DOCMASK_PROFILE_LOG_TOTAL
+    if not _CSA_DOCMASK_PROFILE:
+        return
+    total_calls = sum(count for count, _ in _CSA_DOCMASK_PROFILE_STATS.values())
+    if total_calls == _CSA_DOCMASK_PROFILE_LOG_TOTAL:
+        return
+    if total_calls % _CSA_DOCMASK_PROFILE_INTERVAL != 0:
+        return
+    _CSA_DOCMASK_PROFILE_LOG_TOTAL = total_calls
+    parts = []
+    total_ms = 0.0
+    for name, (count, elapsed) in sorted(_CSA_DOCMASK_PROFILE_STATS.items()):
+        elapsed_ms = elapsed * 1000.0
+        total_ms += elapsed_ms
+        avg_ms = elapsed_ms / count if count else 0.0
+        parts.append(f"{name}:count={count},total_ms={elapsed_ms:.3f},avg_ms={avg_ms:.3f}")
+    rank = _csa_docmask_profile_rank()
+    print(f"[CSA_DOCMASK_PROFILE][rank={rank}] total_ms={total_ms:.3f} " + " | ".join(parts), flush=True)
+
+
+def _csa_docmask_profile_record(name: str, elapsed: float) -> None:
+    if not _CSA_DOCMASK_PROFILE:
+        return
+    stat = _CSA_DOCMASK_PROFILE_STATS[name]
+    stat[0] += 1
+    stat[1] += elapsed
+    _csa_docmask_profile_log()
+
+
+def _csa_docmask_profile(name):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if not _CSA_DOCMASK_PROFILE:
+                return func(*args, **kwargs)
+            _csa_docmask_profile_sync()
+            start = time.perf_counter()
+            result = func(*args, **kwargs)
+            _csa_docmask_profile_sync()
+            _csa_docmask_profile_record(name, time.perf_counter() - start)
+            return result
+
+        return wrapper
+
+    return decorator
+
+
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
 # ---------------------------------------------------------------------------
@@ -108,7 +196,33 @@ def get_cutoff_doc_starts(cutoff_doc_lens: Tensor) -> Tensor:
 
 @dataclass
 class CSADocMaskMetadata:
-    """Reusable CSA metadata derived from startend_row_indices."""
+    """Reusable CSA metadata derived from ``startend_row_indices``.
+
+    Centralizes all document-boundary-derived quantities (document lengths,
+    cutoff lengths, valid compressed ranges, window/compress top-k indices,
+    causal masks) so that a single ``build`` per forward feeds every CSA
+    sub-module (Compressor, CSAIndexer, sparse attention) without recomputing
+    the boundary scan.
+
+    Fields split into three groups:
+      - Source / shape: ``startend_row_indices``, ``ratio``, ``batch_size``,
+        ``seqlen``, ``n_compressed``.
+      - Eagerly computed in ``build``: ``doc_lens``, ``doc_starts``,
+        ``doc_lens_cutoff``, ``doc_starts_cutoff``, ``total_cutoff``,
+        ``actual_n_compressed``, plus per-position tensors (``positions``,
+        ``doc_start_per_pos``, ``pos_in_doc``, ``doc_len_per_pos``,
+        ``is_valid``, ``num_compressed_per_pos``, ``doc_col_start``,
+        ``num_available``, ``range_start``, ``range_end``, ``valid_range``).
+      - Lazily cached (``_``-prefixed): ``_window_topk_idxs`` /
+        ``_window_size``, ``_compress_topk_idxs`` / ``_compress_offset``,
+        ``_compressed_causal_mask``, ``_is_first_compressed_group``. Each is
+        materialized on first access of the corresponding ``get_*`` method and
+        keyed by its parameter (``window_size`` or ``offset``); the cached
+        value is reused on subsequent calls with the same key.
+
+    Use :meth:`matches` to decide whether an existing instance can be reused
+    for a new ``build`` request instead of only comparing ``seqlen``.
+    """
 
     startend_row_indices: Tensor
     ratio: int
@@ -140,6 +254,7 @@ class CSADocMaskMetadata:
     _is_first_compressed_group: Tensor | None = None
 
     @classmethod
+    @_csa_docmask_profile("metadata_build")
     def build(
         cls,
         ratio: int,
@@ -148,9 +263,32 @@ class CSADocMaskMetadata:
         startend_row_indices: Tensor | None,
         n_compressed: int | None = None,
     ) -> CSADocMaskMetadata | None:
+        """Build metadata from ``startend_row_indices``.
+
+        Args:
+            ratio: compression ratio (e.g. 4 or 128).
+            batch_size: batch size; must be 1 (varlen packs docs along seq).
+            seqlen: sequence length; must equal
+                ``startend_row_indices.shape[2]``.
+            startend_row_indices: ``[batch_size, 1, seqlen, 1]`` document
+                boundary tensor where entry ``t`` holds the (exclusive) end
+                row index of ``t``'s document, or ``None`` for causal-only
+                mode (returns ``None``).
+            n_compressed: optional override for ``seqlen // ratio``; used when
+                the caller already knows the compressed slot count.
+
+        Returns:
+            A populated :class:`CSADocMaskMetadata`, or ``None`` when
+            ``startend_row_indices is None``.
+        """
         with RecordEvent("csa_docmask_meta_build"):
             if startend_row_indices is None:
                 return None
+            ratio = _csa_docmask_as_int(ratio, "ratio")
+            batch_size = _csa_docmask_as_int(batch_size, "batch_size")
+            seqlen = _csa_docmask_as_int(seqlen, "seqlen")
+            if n_compressed is not None:
+                n_compressed = _csa_docmask_as_int(n_compressed, "n_compressed")
             if batch_size != 1:
                 raise ValueError(
                     f"only support batch_size = 1, got batch_size: {batch_size}"
@@ -226,13 +364,49 @@ class CSADocMaskMetadata:
                 valid_range=valid_range.unsqueeze(0),
             )
 
+    def matches(
+        self,
+        ratio: int,
+        batch_size: int,
+        seqlen: int,
+        startend_row_indices: Tensor,
+        n_compressed: int | None = None,
+        allow_cloned_startend_row_indices: bool = False,
+    ) -> bool:
+        """Return True if this instance can be reused for the given inputs.
+
+        Compares ``ratio``, ``batch_size``, ``seqlen`` and the identity of
+        ``startend_row_indices`` (and ``n_compressed`` when provided) so that
+        callers do not accidentally reuse a stale cache built from a different
+        mask or compression ratio of the same length. Recompute may pass a
+        clone of the same mask; callers can explicitly permit that case after
+        validating the original mask before entering recompute.
+        """
+        return (
+            self.ratio == ratio
+            and self.batch_size == batch_size
+            and self.seqlen == seqlen
+            and (
+                self.startend_row_indices is startend_row_indices
+                or allow_cloned_startend_row_indices
+            )
+            and (n_compressed is None or self.n_compressed == n_compressed)
+        )
+
     def get_window_topk_idxs(self, window_size: int) -> Tensor:
+        """Return ``[batch_size, seqlen, window_size]`` sliding-window indices.
+
+        Indices reset at each document boundary; invalid slots (beyond the
+        query position, before the document start, or on padding) are set to
+        ``-1``. Cached and keyed by ``window_size``.
+        """
         with RecordEvent("csa_docmask_get_window_topk_idxs"):
-            if (
-                self._window_topk_idxs is None
-                or self._window_size != window_size
-            ):
+            cache_hit = self._window_topk_idxs is not None and self._window_size == window_size
+            _csa_docmask_profile_record("window_topk_hit" if cache_hit else "window_topk_miss", 0.0)
+            if not cache_hit:
                 with RecordEvent("csa_docmask_compute_window_topk_idxs"):
+                    _csa_docmask_profile_sync()
+                    start = time.perf_counter()
                     win_start = paddle.maximum(
                         self.doc_start_per_pos, self.positions - window_size + 1
                     )
@@ -252,15 +426,26 @@ class CSADocMaskMetadata:
                         [self.batch_size, -1, -1]
                     )
                     self._window_size = window_size
+                    _csa_docmask_profile_sync()
+                    _csa_docmask_profile_record(
+                        "window_topk_compute", time.perf_counter() - start
+                    )
             return self._window_topk_idxs
 
     def get_compress_topk_idxs(self, offset: int) -> Tensor:
+        """Return ``[batch_size, seqlen, n_compressed]`` compressed indices.
+
+        For each query position, valid compressed positions (within the
+        document's causal valid range) carry ``compressed_id + offset``;
+        invalid slots are ``-1``. Cached and keyed by ``offset``.
+        """
         with RecordEvent("csa_docmask_get_compress_topk_idxs"):
-            if (
-                self._compress_topk_idxs is None
-                or self._compress_offset != offset
-            ):
+            cache_hit = self._compress_topk_idxs is not None and self._compress_offset == offset
+            _csa_docmask_profile_record("compress_topk_hit" if cache_hit else "compress_topk_miss", 0.0)
+            if not cache_hit:
                 with RecordEvent("csa_docmask_compute_compress_topk_idxs"):
+                    _csa_docmask_profile_sync()
+                    start = time.perf_counter()
                     c_grid = paddle.arange(
                         self.n_compressed, dtype="int64"
                     ).unsqueeze(0)
@@ -278,12 +463,25 @@ class CSADocMaskMetadata:
                         [self.batch_size, -1, -1]
                     )
                     self._compress_offset = offset
+                    _csa_docmask_profile_sync()
+                    _csa_docmask_profile_record(
+                        "compress_topk_compute", time.perf_counter() - start
+                    )
             return self._compress_topk_idxs
 
     def get_compressed_causal_mask(self) -> Tensor:
+        """Return ``[batch_size, seqlen, n_compressed]`` float32 causal mask.
+
+        ``0`` for valid (within the document's compressed range), ``-inf``
+        otherwise. Cached on first access.
+        """
         with RecordEvent("csa_docmask_get_compressed_causal_mask"):
-            if self._compressed_causal_mask is None:
+            cache_hit = self._compressed_causal_mask is not None
+            _csa_docmask_profile_record("causal_mask_hit" if cache_hit else "causal_mask_miss", 0.0)
+            if not cache_hit:
                 with RecordEvent("csa_docmask_compute_compressed_causal_mask"):
+                    _csa_docmask_profile_sync()
+                    start = time.perf_counter()
                     c_grid = paddle.arange(
                         self.n_compressed, dtype="int64"
                     ).unsqueeze(0)
@@ -299,17 +497,131 @@ class CSADocMaskMetadata:
                         paddle.full([1], float("-inf"), dtype="float32"),
                         paddle.zeros([1], dtype="float32"),
                     )
+                    _csa_docmask_profile_sync()
+                    _csa_docmask_profile_record(
+                        "causal_mask_compute", time.perf_counter() - start
+                    )
             return self._compressed_causal_mask
 
     def get_is_first_compressed_group(self) -> Tensor:
-        if self._is_first_compressed_group is None:
+        """Return ``[actual_n_compressed]`` bool flags marking each document's
+        first compressed group (used by overlap transforms to avoid reusing
+        the previous document's data). Cached on first access.
+        """
+        cache_hit = self._is_first_compressed_group is not None
+        _csa_docmask_profile_record("first_group_hit" if cache_hit else "first_group_miss", 0.0)
+        if not cache_hit:
+            _csa_docmask_profile_sync()
+            start = time.perf_counter()
             is_first = paddle.zeros([self.actual_n_compressed], dtype="bool")
             for i in range(len(self.doc_starts_cutoff)):
                 idx = int(self.doc_starts_cutoff[i].item()) // self.ratio
                 if idx < self.actual_n_compressed:
                     is_first[idx] = True
             self._is_first_compressed_group = is_first
+            _csa_docmask_profile_sync()
+            _csa_docmask_profile_record(
+                "first_group_compute", time.perf_counter() - start
+            )
         return self._is_first_compressed_group
+
+
+def _get_csa_docmask_content_key(
+    startend_row_indices: Tensor,
+    ratio: int,
+    batch_size: int,
+    seqlen: int,
+    n_compressed: int | None = None,
+) -> tuple:
+    digest = getattr(startend_row_indices, "_csa_docmask_content_digest", None)
+    if digest is None:
+        digest = hashlib.md5(
+            startend_row_indices.detach().cpu().numpy().tobytes()
+        ).hexdigest()
+        try:
+            setattr(startend_row_indices, "_csa_docmask_content_digest", digest)
+        except AttributeError:
+            pass
+    return (
+        digest,
+        ratio,
+        batch_size,
+        seqlen,
+        str(startend_row_indices.dtype),
+        n_compressed,
+    )
+
+
+def get_or_build_csa_docmask_meta(
+    ratio: int,
+    batch_size: int,
+    seqlen: int,
+    startend_row_indices: Tensor,
+    n_compressed: int | None = None,
+    cache_source_startend_row_indices: Tensor | None = None,
+) -> CSADocMaskMetadata:
+    ratio = _csa_docmask_as_int(ratio, "ratio")
+    batch_size = _csa_docmask_as_int(batch_size, "batch_size")
+    seqlen = _csa_docmask_as_int(seqlen, "seqlen")
+    if n_compressed is not None:
+        n_compressed = _csa_docmask_as_int(n_compressed, "n_compressed")
+    cache_source = (
+        cache_source_startend_row_indices
+        if cache_source_startend_row_indices is not None
+        else startend_row_indices
+    )
+    try:
+        cache_source_key = (
+            cache_source.data_ptr() if cache_source._is_initialized() else id(cache_source)
+        )
+    except (AttributeError, RuntimeError, ValueError):
+        cache_source_key = id(cache_source)
+    cache_key = (cache_source_key, ratio, batch_size, seqlen, n_compressed)
+
+    source_cache = getattr(cache_source, "_csa_docmask_meta_cache", None)
+    if source_cache is not None:
+        docmask_meta = source_cache.get((ratio, batch_size, seqlen, n_compressed))
+        if docmask_meta is not None:
+            _csa_docmask_profile_record("meta_cache_hit", 0.0)
+            return docmask_meta
+
+    docmask_meta = _CSA_DOCMASK_META_CACHE.get(cache_key)
+    if docmask_meta is not None:
+        _csa_docmask_profile_record("meta_cache_hit", 0.0)
+        _CSA_DOCMASK_META_CACHE.move_to_end(cache_key)
+        return docmask_meta
+
+    content_key = _get_csa_docmask_content_key(
+        startend_row_indices, ratio, batch_size, seqlen, n_compressed
+    )
+    docmask_meta = _CSA_DOCMASK_META_CACHE.get(content_key)
+    if docmask_meta is not None:
+        _csa_docmask_profile_record("meta_cache_hit", 0.0)
+        _CSA_DOCMASK_META_CACHE[cache_key] = docmask_meta
+        _CSA_DOCMASK_META_CACHE.move_to_end(content_key)
+        return docmask_meta
+
+    _csa_docmask_profile_record("meta_cache_miss", 0.0)
+    docmask_meta = CSADocMaskMetadata.build(
+        ratio, batch_size, seqlen, startend_row_indices, n_compressed
+    )
+
+    source_cache_key = (ratio, batch_size, seqlen, n_compressed)
+    if source_cache is None:
+        source_cache = {}
+        try:
+            setattr(cache_source, "_csa_docmask_meta_cache", source_cache)
+        except AttributeError:
+            source_cache = None
+    if source_cache is not None:
+        source_cache[source_cache_key] = docmask_meta
+
+    _CSA_DOCMASK_META_CACHE[cache_key] = docmask_meta
+    _CSA_DOCMASK_META_CACHE[content_key] = docmask_meta
+    _CSA_DOCMASK_META_CACHE.move_to_end(content_key)
+    while len(_CSA_DOCMASK_META_CACHE) > _CSA_DOCMASK_META_CACHE_LIMIT:
+        _CSA_DOCMASK_META_CACHE.popitem(last=False)
+    return docmask_meta
 
 
 def get_compress_topk_idxs(
@@ -1262,9 +1574,18 @@ class Compressor(nn.Layer):
         # Shared compression logic for both CP and non-CP paths.
         if startend_row_indices is not None:
             # per-document cutoff, pack contiguously without padding
-            if docmask_meta is None or docmask_meta.seqlen != sq:
-                docmask_meta = CSADocMaskMetadata.build(
-                    ratio, b, sq, startend_row_indices
+            if docmask_meta is None or not docmask_meta.matches(
+                ratio,
+                b,
+                sq,
+                startend_row_indices,
+                allow_cloned_startend_row_indices=True,
+            ):
+                docmask_meta = get_or_build_csa_docmask_meta(
+                    ratio=ratio,
+                    batch_size=b,
+                    seqlen=sq,
+                    startend_row_indices=startend_row_indices,
                 )
             doc_lens = docmask_meta.doc_lens
             doc_starts = docmask_meta.doc_starts
@@ -2040,9 +2361,18 @@ class CompressedSparseAttention(FleetLayer):
             )
 
         if startend_row_indices is not None and self.compress_ratio > 1:
-            if docmask_meta is None or docmask_meta.seqlen != sq:
-                docmask_meta = CSADocMaskMetadata.build(
-                    self.compress_ratio, b, sq, startend_row_indices
+            if docmask_meta is None or not docmask_meta.matches(
+                self.compress_ratio,
+                b,
+                sq,
+                startend_row_indices,
+                allow_cloned_startend_row_indices=True,
+            ):
+                docmask_meta = get_or_build_csa_docmask_meta(
+                    ratio=self.compress_ratio,
+                    batch_size=b,
+                    seqlen=sq,
+                    startend_row_indices=startend_row_indices,
                 )
             actual_n_compressed = docmask_meta.actual_n_compressed
         elif self.compress_ratio > 1:
@@ -2193,9 +2523,18 @@ class CompressedSparseAttention(FleetLayer):
                 q_positions, self.window_size, b, sq_global
             )
         else:
-            if docmask_meta is None or docmask_meta.seqlen != sq_global:
-                docmask_meta = CSADocMaskMetadata.build(
-                    self.compress_ratio, b, sq_global, startend_row_indices
+            if docmask_meta is None or not docmask_meta.matches(
+                self.compress_ratio,
+                b,
+                sq_global,
+                startend_row_indices,
+                allow_cloned_startend_row_indices=True,
+            ):
+                docmask_meta = get_or_build_csa_docmask_meta(
+                    ratio=self.compress_ratio,
+                    batch_size=b,
+                    seqlen=sq_global,
+                    startend_row_indices=startend_row_indices,
                 )
             full_window_idxs = docmask_meta.get_window_topk_idxs(
                 self.window_size
@@ -2223,9 +2562,18 @@ class CompressedSparseAttention(FleetLayer):
 
         # Compute actual_n_compressed accounting for document boundaries
         if startend_row_indices is not None and self.compress_ratio > 1:
-            if docmask_meta is None or docmask_meta.seqlen != sq_global:
-                docmask_meta = CSADocMaskMetadata.build(
-                    self.compress_ratio, b, sq_global, startend_row_indices
+            if docmask_meta is None or not docmask_meta.matches(
+                self.compress_ratio,
+                b,
+                sq_global,
+                startend_row_indices,
+                allow_cloned_startend_row_indices=True,
+            ):
+                docmask_meta = get_or_build_csa_docmask_meta(
+                    ratio=self.compress_ratio,
+                    batch_size=b,
+                    seqlen=sq_global,
+                    startend_row_indices=startend_row_indices,
                 )
             actual_n_compressed = docmask_meta.actual_n_compressed
         elif self.compress_ratio > 1:

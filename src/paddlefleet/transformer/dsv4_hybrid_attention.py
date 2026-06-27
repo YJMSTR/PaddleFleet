@@ -44,7 +44,11 @@ from paddlefleet.models.common.embeddings.yarn_rotary_pos_embedding import (
     YarnRotaryEmbedding,
 )
 from paddlefleet.transformer.attention import Attention
-from paddlefleet.transformer.csa_attention import CSADocMaskMetadata
+from paddlefleet.transformer.csa_attention import (
+    CSADocMaskMetadata,
+    get_or_build_csa_docmask_meta,
+)
+from paddlefleet.utils import get_pg_rank
 
 if TYPE_CHECKING:
     from paddlefleet.process_groups_config import ProcessGroupCollection
@@ -69,7 +73,23 @@ def build_document_rope_freqs(
     position_offset: int = 0,
     doc_lens: Tensor | None = None,
 ):
-    """Build RoPE frequencies that restart from zero for each document."""
+    """Build RoPE frequencies that restart from zero for each document.
+
+    Args:
+        rotary_pos_emb: the layer's RotaryEmbedding / YarnRotaryEmbedding.
+        sq: local query sequence length.
+        startend_row_indices: ``[1, 1, seqlen, 1]`` document boundary tensor.
+        position_offset: global position offset for CP (``cp_rank * sq``);
+            the returned freqs cover ``[0, position_offset + sq)`` and are
+            sliced by the caller.
+        doc_lens: optional precomputed document lengths (e.g. from
+            ``CSADocMaskMetadata.doc_lens``) to avoid recomputing them from
+            ``startend_row_indices``.
+
+    Returns:
+        (freqs, mscale): ``freqs`` is ``[1, position_offset + sq, 1, head_dim]``
+        and ``mscale`` is the YaRN mscale (DSv4 forces it to 1.0 downstream).
+    """
     with RecordEvent("dsv4_document_rope_freqs"):
         assert (
             startend_row_indices.shape[0] == 1
@@ -286,14 +306,45 @@ class DSv4HybridAttention(Attention):
         )
         b, sq, _ = hidden_states.shape
         position_offset = cp_rank * sq if cp_size > 1 else 0
-        docmask_meta = None
-        if startend_row_indices is not None:
-            docmask_meta = CSADocMaskMetadata.build(
-                max(1, int(getattr(self.core_attention, "compress_ratio", 1))),
+
+        # When sequence parallel is active (and CP is not), hidden_states is
+        # the local TP slice but attn_mask_startend_row_indices may still be
+        # global. Slice it to the local range and remap row indices to local
+        # coordinates so CSADocMaskMetadata sees a consistent (seqlen, mask).
+        if (
+            startend_row_indices is not None
+            and cp_size == 1
+            and startend_row_indices.shape[2] != sq
+        ):
+            tp_rank = get_pg_rank(self.pg_collection.tp)
+            local_offset = tp_rank * sq
+            startend_row_indices = paddle.clip(
+                startend_row_indices[
+                    :, :, local_offset : local_offset + sq, :
+                ]
+                - local_offset,
+                min=0,
+            ).astype(paddle.int32)
+
+        docmask_meta = kwargs.get("csa_docmask_meta", None)
+        ratio = int(getattr(self.core_attention, "compress_ratio", 0))
+        if startend_row_indices is not None and ratio > 1:
+            docmask_seqlen = sq * cp_size if cp_size > 1 else sq
+            if docmask_meta is None or not docmask_meta.matches(
+                ratio,
                 b,
-                sq * cp_size,
+                docmask_seqlen,
                 startend_row_indices,
-            )
+                allow_cloned_startend_row_indices=True,
+            ):
+                docmask_meta = get_or_build_csa_docmask_meta(
+                    ratio=ratio,
+                    batch_size=b,
+                    seqlen=docmask_seqlen,
+                    startend_row_indices=startend_row_indices,
+                )
+        else:
+            docmask_meta = None
 
         query, key, value, q_compressed, kv_compressed = (
             self.get_query_key_value_tensors(
@@ -517,6 +568,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             position_offset: global position offset for CP (cp_rank * sq_local).
                 When non-zero, RoPE frequencies are sliced from the correct
                 global starting position.
+            docmask_meta: optional :class:`CSADocMaskMetadata` carrying
+                precomputed ``doc_lens`` so document RoPE frequencies can be
+                built without rescanning ``startend_row_indices``.
 
         Returns:
             query: [b, sq, num_heads, v_head_dim]

@@ -41,12 +41,16 @@ from paddlefleet.recompute_utils import (
     need_recompute_in_block,
     need_recompute_in_first_n,
 )
+from paddlefleet.transformer.csa_attention import (
+    CSADocMaskMetadata,
+    get_or_build_csa_docmask_meta,
+)
 from paddlefleet.transformer.dsv4_hybrid_attention import DSv4HybridAttention
 from paddlefleet.transformer.identity_op import IdentityFuncOp, IdentityOp
 from paddlefleet.transformer.mlp import MLP
 from paddlefleet.transformer.moe.moe_layer import MoELayer
 from paddlefleet.transformer.utils import profile
-from paddlefleet.utils import log_single_rank
+from paddlefleet.utils import get_pg_rank, log_single_rank
 
 if is_deep_ep_available():
     if paddle.is_compiled_with_cuda():
@@ -86,7 +90,7 @@ def tensors_clone(outputs):
     elif isinstance(outputs, dict):
         res = {}
         for key, value in outputs.items():
-            res[key] = value.clone()
+            res[key] = value.clone() if isinstance(value, paddle.Tensor) else value
         return res
     else:
         raise ValueError(
@@ -574,6 +578,44 @@ class TransformerLayer(nn.Layer):
                 # mtp masks are in mtp_startend_row_indices_all and will be used by MTP layer directly
                 attn_mask_startend_row_indices_mtp = None
 
+        csa_docmask_meta = None
+        attn_mask_startend_row_indices = dict_args.get(
+            "attn_mask_startend_row_indices", None
+        )
+        if (
+            attn_mask_startend_row_indices is not None
+            and isinstance(self.self_attn, DSv4HybridAttention)
+        ):
+            cache_source_startend_row_indices = attn_mask_startend_row_indices
+            hidden_states = dict_args["hidden_states"]
+            cp_pg = getattr(self, "pg_collection", None)
+            cp_pg = cp_pg.cp if cp_pg is not None else None
+            cp_size = getattr(cp_pg, "nranks", 1) if cp_pg is not None else 1
+            b, sq, _ = hidden_states.shape
+            if cp_size == 1 and attn_mask_startend_row_indices.shape[2] != sq:
+                tp_rank = get_pg_rank(self.pg_collection.tp)
+                local_offset = tp_rank * sq
+                attn_mask_startend_row_indices = paddle.clip(
+                    attn_mask_startend_row_indices[
+                        :, :, local_offset : local_offset + sq, :
+                    ]
+                    - local_offset,
+                    min=0,
+                ).astype(paddle.int32)
+                seq_len = sq
+            else:
+                seq_len = sq * cp_size
+            ratio = int(getattr(self.self_attn.core_attention, "compress_ratio", 0))
+            if ratio > 1:
+                csa_docmask_meta = get_or_build_csa_docmask_meta(
+                    ratio=ratio,
+                    batch_size=b,
+                    seqlen=seq_len,
+                    startend_row_indices=attn_mask_startend_row_indices,
+                    cache_source_startend_row_indices=cache_source_startend_row_indices,
+                )
+            dict_args["attn_mask_startend_row_indices"] = attn_mask_startend_row_indices
+
         if self.config.block_attention_residuals and "blocks" not in dict_args:
             dict_args["blocks"] = []
 
@@ -628,9 +670,13 @@ class TransformerLayer(nn.Layer):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 input_ids=input_ids,
+                csa_docmask_meta=csa_docmask_meta,
             )
         else:
-            outputs = self._forward_impl(**dict_args)
+            outputs = self._forward_impl(
+                **dict_args,
+                csa_docmask_meta=csa_docmask_meta,
+            )
 
         if isinstance(outputs, tuple):
             output, context = outputs[0], outputs[1]
@@ -714,6 +760,7 @@ class TransformerLayer(nn.Layer):
         attention_bias: Tensor | None = None,
         packed_seq_params: PackedSeqParams | None = None,
         input_ids: Tensor | None = None,
+        csa_docmask_meta: CSADocMaskMetadata | None = None,
         **kwargs,
     ):
         def need_do_attention():
@@ -778,6 +825,7 @@ class TransformerLayer(nn.Layer):
                         block_attention_residuals=True,
                         in_recompute=self.full_recompute,
                         input_ids=input_ids,
+                        csa_docmask_meta=csa_docmask_meta,
                         **kwargs,
                     )
 
@@ -829,6 +877,7 @@ class TransformerLayer(nn.Layer):
                         packed_seq_params=packed_seq_params,
                         in_recompute=self.full_recompute,
                         input_ids=input_ids,
+                        csa_docmask_meta=csa_docmask_meta,
                         **kwargs,
                     )
             self._log_md5(
@@ -862,6 +911,7 @@ class TransformerLayer(nn.Layer):
         is_first_fwd: bool = False,
         block_attention_residuals: bool = False,
         input_ids: Tensor | None = None,
+        csa_docmask_meta: CSADocMaskMetadata | None = None,
         **kwargs,
     ):
         """
@@ -907,10 +957,11 @@ class TransformerLayer(nn.Layer):
         )
 
         extra_kwargs = {}
-        if input_ids is not None and isinstance(
-            self.self_attn, DSv4HybridAttention
-        ):
-            extra_kwargs["input_ids"] = input_ids
+        if isinstance(self.self_attn, DSv4HybridAttention):
+            if input_ids is not None:
+                extra_kwargs["input_ids"] = input_ids
+            if csa_docmask_meta is not None:
+                extra_kwargs["csa_docmask_meta"] = csa_docmask_meta
 
         if rope_freqs_cis is not None:
             attention_output_with_bias = self.self_attn(
@@ -1188,6 +1239,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         packed_seq_params: PackedSeqParams | None = None,
         in_recompute: bool = False,
         is_first_fwd: bool = False,
+        csa_docmask_meta: CSADocMaskMetadata | None = None,
         **kwargs,
     ):
         """mHC attention forward: aggregate → layernorm → attention → fused_h_res_h_post_bda."""
@@ -1213,10 +1265,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         # Self-attention
         extra_kwargs = {}
-        if kwargs.get("input_ids") is not None and isinstance(
-            self.self_attn, DSv4HybridAttention
-        ):
-            extra_kwargs["input_ids"] = kwargs["input_ids"]
+        if isinstance(self.self_attn, DSv4HybridAttention):
+            if kwargs.get("input_ids") is not None:
+                extra_kwargs["input_ids"] = kwargs["input_ids"]
+            if csa_docmask_meta is not None:
+                extra_kwargs["csa_docmask_meta"] = csa_docmask_meta
 
         if rope_freqs_cis is not None:
             attention_output_with_bias = self.self_attn(
