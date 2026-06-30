@@ -30,13 +30,20 @@ import argparse
 import statistics
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING
 
 import paddle
 
-from paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn import cudnn_indexer_topk
-from paddlefleet.cudnn_ops.indexer.docmask_utils import shift_scores_to_local_window
+from paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn import (
+    cudnn_indexer_topk,
+)
+from paddlefleet.cudnn_ops.indexer.docmask_utils import (
+    shift_scores_to_local_window,
+)
 from paddlefleet.transformer.csa_attention import get_valid_range
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @dataclass(frozen=True)
@@ -53,7 +60,9 @@ def _sync() -> None:
     paddle.device.synchronize()
 
 
-def _time_ms(fn: Callable[[], object], warmup: int, repeat: int) -> tuple[float, float, float]:
+def _time_ms(
+    fn: Callable[[], object], warmup: int, repeat: int
+) -> tuple[float, float, float]:
     for _ in range(warmup):
         fn()
     _sync()
@@ -74,7 +83,9 @@ def _time_ms(fn: Callable[[], object], warmup: int, repeat: int) -> tuple[float,
 
 def _make_startend(doc_lens: tuple[int, ...], sq: int) -> paddle.Tensor:
     if sum(doc_lens) != sq:
-        raise ValueError(f"sum(doc_lens) must equal sq ({sq}), got {sum(doc_lens)}")
+        raise ValueError(
+            f"sum(doc_lens) must equal sq ({sq}), got {sum(doc_lens)}"
+        )
     ends = []
     acc = 0
     for doc_len in doc_lens:
@@ -95,7 +106,9 @@ def _parse_doc_lens(value: str | None, sq: int) -> tuple[int, ...]:
     return (sq // 4, sq // 4, sq // 4, sq // 4)
 
 
-def _run_case(case: Case, warmup: int, repeat: int) -> dict[str, float | str | int]:
+def _run_case(
+    case: Case, warmup: int, repeat: int
+) -> dict[str, float | str | int]:
     paddle.seed(2026)
     scores = paddle.randn([1, case.sq, case.sk], dtype="float32")
 
@@ -117,10 +130,13 @@ def _run_case(case: Case, warmup: int, repeat: int) -> dict[str, float | str | i
 
     shift_mean = shift_median = shift_stdev = 0.0
     if valid_range is not None:
+
         def run_shift():
             return shift_scores_to_local_window(scores, valid_range)
 
-        shift_mean, shift_median, shift_stdev = _time_ms(run_shift, warmup, repeat)
+        shift_mean, shift_median, shift_stdev = _time_ms(
+            run_shift, warmup, repeat
+        )
 
     return {
         "case": case.name,
@@ -128,7 +144,9 @@ def _run_case(case: Case, warmup: int, repeat: int) -> dict[str, float | str | i
         "sk": case.sk,
         "topk": case.topk,
         "ratio": case.ratio,
-        "docs": "none" if case.doc_lens is None else "+".join(str(x) for x in case.doc_lens),
+        "docs": "none"
+        if case.doc_lens is None
+        else "+".join(str(x) for x in case.doc_lens),
         "topk_mean_ms": mean,
         "topk_median_ms": median,
         "topk_stdev_ms": stdev,
@@ -168,7 +186,9 @@ def main() -> None:
     if major != 10:
         raise RuntimeError(f"cuDNN IndexerTopK requires SM100, got SM{major}x")
 
-    sk = int(args.sk) if args.sk is not None else int(args.sq) // int(args.ratio)
+    sk = (
+        int(args.sk) if args.sk is not None else int(args.sq) // int(args.ratio)
+    )
     cases = [Case("causal", args.sq, sk, args.topk, args.ratio, None)]
     if not args.causal_only:
         cases.append(
@@ -192,7 +212,9 @@ def main() -> None:
         causal = float(rows[0]["topk_median_ms"])
         docmask = float(rows[1]["topk_median_ms"])
         if causal > 0:
-            print(f"docmask / causal topk median ratio: {docmask / causal:.3f}x")
+            print(
+                f"docmask / causal topk median ratio: {docmask / causal:.3f}x"
+            )
 
 
 if __name__ == "__main__":

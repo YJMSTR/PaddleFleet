@@ -74,6 +74,8 @@ def _make_config(
     num_nextn_predict_layers=0,
     csa_indexer_backend="unfused",
     csa_sparse_attn_backend="unfused",
+    tensor_model_parallel_size=1,
+    context_parallel_size=1,
 ):
     if csa_compress_ratios is None:
         csa_compress_ratios = [0, 4, 128, 4]
@@ -116,6 +118,8 @@ def _make_config(
         softmax_type="vanilla",
         csa_indexer_backend=csa_indexer_backend,
         csa_sparse_attn_backend=csa_sparse_attn_backend,
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        context_parallel_size=context_parallel_size,
     )
 
 
@@ -179,6 +183,25 @@ class TestDSv4HybridConfigAndSpec(unittest.TestCase):
             ValueError, "csa_sparse_attn_backend='paddle' is invalid"
         ):
             _make_config(csa_sparse_attn_backend="paddle")
+
+    def test_csa_cudnn_indexer_allows_config_with_cp(self):
+        cfg = _make_config(csa_indexer_backend="cudnn", context_parallel_size=2)
+        self.assertEqual(cfg.csa_indexer_backend, "cudnn")
+        self.assertEqual(cfg.context_parallel_size, 2)
+
+    def test_csa_rejects_tensor_parallel_gt_one(self):
+        cfg = _make_config(
+            num_layers=1,
+            csa_compress_ratios=[4],
+            num_attention_heads=2,
+            dsa_index_n_heads=32,
+            dsa_index_head_dim=128,
+            tensor_model_parallel_size=2,
+        )
+        with self.assertRaisesRegex(
+            NotImplementedError, "tensor parallel size > 1"
+        ):
+            _build_attention(cfg, layer_number=0)
 
     def test_removed_tilelang_switches_raise(self):
         removed_switches = (

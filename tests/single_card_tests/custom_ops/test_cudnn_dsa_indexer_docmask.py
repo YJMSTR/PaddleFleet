@@ -465,8 +465,10 @@ class TestCudnnIndexerTopkDocmask(unittest.TestCase):
                 f"query {q}: THD {thd_np[q]} != BSHD {bshd_np[q]}",
             )
 
-    def test_thd_docmask_drops_non_ratio_aligned_query_tails(self):
-        """THD pre-processing drops per-document query tails before kernel entry."""
+    def test_non_ratio_aligned_docs_fall_back_without_dropping_query_tails(
+        self,
+    ):
+        """Non-ratio-aligned docs must use fallback and keep tail queries valid."""
         from paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn import (
             cudnn_indexer_topk_fwd,
         )
@@ -476,7 +478,10 @@ class TestCudnnIndexerTopkDocmask(unittest.TestCase):
         ratio, topk, h, d = 4, 8, 64, 128
         doc_lens = [23, 9]
         sq = sum(doc_lens)
-        sk = max((sq + ratio - 1) // ratio, sum(length // ratio for length in doc_lens))
+        sk = max(
+            (sq + ratio - 1) // ratio,
+            sum(length // ratio for length in doc_lens),
+        )
         ends = []
         offset = 0
         for length in doc_lens:
@@ -484,14 +489,6 @@ class TestCudnnIndexerTopkDocmask(unittest.TestCase):
             ends.extend([offset] * length)
         startend = paddle.to_tensor(ends, dtype="int32").reshape([1, sq, 1])
         valid_range = get_valid_range(ratio, 1, sq, startend)
-        clipped_vr_np = valid_range.numpy()
-        doc_start = 0
-        for length in doc_lens:
-            aligned = (length // ratio) * ratio
-            clipped_vr_np[0, doc_start + aligned : doc_start + length, :] = 0
-            doc_start += length
-        clipped_valid_range = paddle.to_tensor(clipped_vr_np, dtype="int32")
-
         index_q = paddle.randn([1, sq, h, d]).astype("bfloat16")
         index_k = paddle.randn([1, sk, d]).astype("bfloat16")
         weights = paddle.randn([1, sq, h]).astype("bfloat16")
@@ -512,7 +509,65 @@ class TestCudnnIndexerTopkDocmask(unittest.TestCase):
             weights,
             ratio=ratio,
             topk_effective=topk,
-            valid_range=clipped_valid_range,
+            valid_range=valid_range,
+            return_topk_scores=True,
+        )
+
+        self.assertTrue(paddle.equal_all(thd_len, bshd_len).item())
+        vr_np = valid_range.numpy()[0]
+        self.assertGreater(int(vr_np[22, 1] - vr_np[22, 0]), 0)
+        self.assertGreater(int(vr_np[31, 1] - vr_np[31, 0]), 0)
+        self.assertGreater(int(thd_len.numpy()[0, 22]), 0)
+        self.assertGreater(int(thd_len.numpy()[0, 31]), 0)
+        thd_np = thd_idx.numpy()[0]
+        bshd_np = bshd_idx.numpy()[0]
+        for q in range(sq):
+            self.assertEqual(
+                {int(x) for x in thd_np[q] if x >= 0},
+                {int(x) for x in bshd_np[q] if x >= 0},
+                f"query {q}: THD/fallback {thd_np[q]} != BSHD {bshd_np[q]}",
+            )
+
+    def test_short_document_falls_back_without_thd_kernel_error(self):
+        """Documents with fewer than two compressed cols must skip THD."""
+        from paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn import (
+            cudnn_indexer_topk_fwd,
+        )
+        from paddlefleet.transformer.csa_attention import get_valid_range
+
+        paddle.seed(23)
+        ratio, topk, h, d = 4, 8, 64, 128
+        doc_lens = [4, 12]
+        sq = sum(doc_lens)
+        sk = sum(length // ratio for length in doc_lens)
+        ends = []
+        offset = 0
+        for length in doc_lens:
+            offset += length
+            ends.extend([offset] * length)
+        startend = paddle.to_tensor(ends, dtype="int32").reshape([1, sq, 1])
+        valid_range = get_valid_range(ratio, 1, sq, startend)
+        index_q = paddle.randn([1, sq, h, d]).astype("bfloat16")
+        index_k = paddle.randn([1, sk, d]).astype("bfloat16")
+        weights = paddle.randn([1, sq, h]).astype("bfloat16")
+
+        thd_idx, thd_len, _ = cudnn_indexer_topk_fwd(
+            index_q,
+            index_k,
+            weights,
+            ratio=ratio,
+            topk_effective=topk,
+            valid_range=valid_range,
+            startend_row_indices=startend,
+            return_topk_scores=True,
+        )
+        bshd_idx, bshd_len, _ = cudnn_indexer_topk_fwd(
+            index_q,
+            index_k,
+            weights,
+            ratio=ratio,
+            topk_effective=topk,
+            valid_range=valid_range,
             return_topk_scores=True,
         )
 
@@ -523,7 +578,7 @@ class TestCudnnIndexerTopkDocmask(unittest.TestCase):
             self.assertEqual(
                 {int(x) for x in thd_np[q] if x >= 0},
                 {int(x) for x in bshd_np[q] if x >= 0},
-                f"query {q}: THD {thd_np[q]} != clipped BSHD {bshd_np[q]}",
+                f"query {q}: short-doc fallback {thd_np[q]} != BSHD {bshd_np[q]}",
             )
 
 

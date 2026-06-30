@@ -61,6 +61,18 @@ class TestCudnnIndexerShapeGuard(unittest.TestCase):
             _check_cudnn_indexer_shape_support(iq, ik, ratio=4)
         self.assertIn("S_q <= S_k * ratio", str(cm.exception))
 
+    def test_seq_offset_counts_toward_ratio_bound(self):
+        # CP causal-only mode pads virtual query rows before the local chunk,
+        # so S_q + seq_offset must still fit the global compressed length.
+        iq, ik, w = _qkw(4, 2)  # 4 + 5 > 2 * 4
+        with self.assertRaises(ValueError) as cm:
+            _check_cudnn_indexer_shape_support(iq, ik, ratio=4, seq_offset=5)
+        self.assertIn("seq_offset=5", str(cm.exception))
+
+    def test_seq_offset_boundary_passes(self):
+        iq, ik, w = _qkw(4, 2)  # 4 + 4 == 2 * 4
+        _check_cudnn_indexer_shape_support(iq, ik, ratio=4, seq_offset=4)
+
     def test_sk1_checked_before_ratio(self):
         # When both would trip, the S_k>=2 message wins (checked first).
         iq, ik, w = _qkw(5, 1)  # S_k==1 and 5 > 1*4
